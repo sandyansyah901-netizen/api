@@ -1,0 +1,8 @@
+Sync semua files ke gdrive1:
+
+bash
+# Dry run dulu (preview tanpa copy)
+rclone sync gdrive:manga_library gdrive1:manga_library --dry-run
+
+# Jika OK, jalankan actual sync
+rclone sync gdrive:manga_library gdrive1:manga_library --progress --transfers=4 --checkers=8
