@@ -9,6 +9,7 @@ FITUR BARU:
 ✅ Extract cover, description, genres dari file
 ✅ ✨ Extract alt titles dari alt_titles.txt (BARU!)
 ✅ ✨ Support custom preview.jpg per chapter (BARU!)
+✅ ✨ Auto-detect manga type dari file marker (manga.txt/manhwa.txt/dll) (BARU!)
 ✅ Skip existing data (smart merge)
 ✅ Auto-generate slug dari nama folder
 ✅ Batch upload ke GDrive + DB
@@ -22,6 +23,16 @@ REVISI COVER:
    dengan pass source_filename=cover_path.name
 ✅ backup_cover_to_gdrive() sekarang pakai nama file asli (bukan hardcode .jpg)
    karena CoverService sudah menggunakan nama file dengan ekstensi yang benar
+
+REVISI TYPE DETECTION:
+✅ _read_manga_type() — deteksi type dari file marker di dalam folder manga:
+   - manga.txt     → type_slug = "manga"
+   - manhwa.txt    → type_slug = "manhwa"
+   - manhua.txt    → type_slug = "manhua"
+   - novel.txt     → type_slug = "novel"
+   - doujinshi.txt → type_slug = "doujinshi"
+   - one-shot.txt  → type_slug = "one-shot"
+   Kalau tidak ada file marker → pakai default type_slug dari parameter API
 """
 
 import logging
@@ -51,6 +62,16 @@ class SmartBulkImportService:
     ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
     COVER_NAMES = {"cover.jpg", "cover.jpeg", "cover.png", "cover.webp"}
     PREVIEW_NAMES = {"preview.jpg", "preview.jpeg", "preview.png", "preview.webp"}  # ✨ BARU
+
+    # ✨ BARU: Mapping file marker → type_slug
+    TYPE_MARKER_FILES = {
+        "manga.txt": "manga",
+        "manhwa.txt": "manhwa",
+        "manhua.txt": "manhua",
+        "novel.txt": "novel",
+        "doujinshi.txt": "doujinshi",
+        "one-shot.txt": "one-shot",
+    }
 
     def __init__(self, db):
         self.db = db
@@ -127,6 +148,9 @@ class SmartBulkImportService:
             # ✨ Read alt titles (BARU!)
             alt_titles = self._read_alt_titles(folder)
 
+            # ✨ BARU: Detect manga type dari file marker
+            detected_type_slug = self._read_manga_type(folder)
+
             # Detect chapters
             chapters = self._detect_chapters(folder)
 
@@ -140,7 +164,8 @@ class SmartBulkImportService:
                 "cover_path": cover_path,
                 "description": description,
                 "genres": genres,
-                "alt_titles": alt_titles,  # ✨ BARU
+                "alt_titles": alt_titles,          # ✨ BARU
+                "detected_type_slug": detected_type_slug,  # ✨ BARU: None jika tidak ada marker
                 "chapters": chapters,
                 "folder_path": folder
             }
@@ -276,6 +301,70 @@ class SmartBulkImportService:
 
         return alt_titles
 
+    # ==========================================
+    # ✨ BARU: _read_manga_type
+    # Deteksi type manga dari file marker di dalam folder manga.
+    #
+    # Cara pakai di ZIP:
+    #   One Piece/
+    #     manga.txt       ← isi bebas atau kosong, yang penting nama filenya
+    #     cover.jpg
+    #     ...
+    #
+    #   Tower of God/
+    #     manhwa.txt      ← otomatis type = manhwa
+    #     cover.jpg
+    #     ...
+    #
+    # Supported markers:
+    #   manga.txt     → "manga"
+    #   manhwa.txt    → "manhwa"
+    #   manhua.txt    → "manhua"
+    #   novel.txt     → "novel"
+    #   doujinshi.txt → "doujinshi"
+    #   one-shot.txt  → "one-shot"
+    # ==========================================
+
+    def _read_manga_type(self, folder: Path) -> Optional[str]:
+        """
+        ✨ BARU: Auto-detect manga type dari file marker di folder manga.
+
+        Cari file seperti manga.txt / manhwa.txt / manhua.txt / dll.
+        Isi file tidak penting, yang penting nama filenya.
+
+        Args:
+            folder: Manga folder path
+
+        Returns:
+            type_slug string (e.g. "manga", "manhwa", "manhua") atau None
+            jika tidak ada file marker ditemukan.
+        """
+        # Cek exact match dulu (case-sensitive)
+        for marker_filename, type_slug in self.TYPE_MARKER_FILES.items():
+            marker_path = folder / marker_filename
+            if marker_path.exists() and marker_path.is_file():
+                logger.info(
+                    f"✅ Detected manga type from marker '{marker_filename}': {type_slug}"
+                )
+                return type_slug
+
+        # Case-insensitive fallback
+        try:
+            for file in folder.iterdir():
+                if not file.is_file():
+                    continue
+                filename_lower = file.name.lower()
+                if filename_lower in self.TYPE_MARKER_FILES:
+                    type_slug = self.TYPE_MARKER_FILES[filename_lower]
+                    logger.info(
+                        f"✅ Detected manga type from marker '{file.name}' (case-insensitive): {type_slug}"
+                    )
+                    return type_slug
+        except Exception as e:
+            logger.warning(f"Error scanning for type markers: {str(e)}")
+
+        return None  # Tidak ada marker → pakai default dari parameter API
+
     def _find_preview_in_chapter(self, chapter_folder: Path) -> Optional[Path]:
         """
         ✨ BARU: Find preview.jpg in chapter folder.
@@ -375,7 +464,7 @@ class SmartBulkImportService:
         dry_run: bool = False
     ) -> Dict:
         """
-        �� SMART IMPORT: Auto-detect dan import manga dari ZIP.
+        🚀 SMART IMPORT: Auto-detect dan import manga dari ZIP.
 
         Features:
         - Auto-generate slug dari nama folder
@@ -383,6 +472,7 @@ class SmartBulkImportService:
         - ✨ Extract alt titles dari alt_titles.txt (BARU!)
         - ✨ Support custom preview.jpg per chapter (BARU!)
         - ✅ Cover preserve format asli (jpg/png/webp) - REVISI
+        - ✨ Auto-detect type dari file marker (manga.txt/manhwa.txt/dll) (BARU!)
         - Skip existing data (smart merge)
         - Upload cover ke local + GDrive backup
         - Upload chapters ke GDrive
@@ -392,7 +482,7 @@ class SmartBulkImportService:
             zip_content: ZIP file content
             uploader_id: ID user yang upload
             storage_id: Storage source ID (default: 1)
-            type_slug: Manga type slug (default: "manga")
+            type_slug: Default manga type slug jika tidak ada marker (default: "manga")
             default_status: Default manga status (default: "ongoing")
             dry_run: Preview only tanpa upload
 
@@ -423,18 +513,19 @@ class SmartBulkImportService:
 
             logger.info(f"Found {len(manga_folders)} manga folders")
 
-            # 3. Validate storage & type
+            # 3. Validate storage
             storage = self.db.query(StorageSource).filter(
                 StorageSource.id == storage_id
             ).first()
             if not storage:
                 raise ValueError(f"Storage ID {storage_id} tidak ditemukan")
 
-            manga_type = self.db.query(MangaType).filter(
+            # ✨ BARU: Validate default type (fallback)
+            default_manga_type = self.db.query(MangaType).filter(
                 MangaType.slug == type_slug
             ).first()
-            if not manga_type:
-                raise ValueError(f"Manga type '{type_slug}' tidak ditemukan")
+            if not default_manga_type:
+                raise ValueError(f"Default manga type '{type_slug}' tidak ditemukan")
 
             base_folder_id = storage.base_folder_id
 
@@ -451,15 +542,20 @@ class SmartBulkImportService:
                     if manga_info['cover_path']:
                         cover_format = manga_info['cover_path'].suffix.lower()
 
+                    # ✨ BARU: resolved type untuk dry run
+                    resolved_type = manga_info['detected_type_slug'] or type_slug
+
                     preview.append({
                         "title": manga_info['title'],
                         "slug": manga_info['slug'],
                         "exists": existing is not None,
                         "has_cover": manga_info['cover_path'] is not None,
-                        "cover_format": cover_format,  # ✅ REVISI: tambah info format cover
+                        "cover_format": cover_format,       # ✅ REVISI: tambah info format cover
                         "has_description": manga_info['description'] is not None,
                         "genres": manga_info['genres'],
                         "alt_titles": manga_info['alt_titles'],  # ✨ BARU
+                        "detected_type": resolved_type,         # ✨ BARU: type yang akan dipakai
+                        "type_from_marker": manga_info['detected_type_slug'] is not None,  # ✨ BARU
                         "total_chapters": len(manga_info['chapters']),
                         "chapters": [
                             {
@@ -481,10 +577,27 @@ class SmartBulkImportService:
 
             # 4. Process setiap manga
             for manga_info in manga_folders:
+                # ✨ BARU: Resolve type per manga
+                # Jika ada file marker di folder → pakai itu
+                # Jika tidak → pakai default type_slug dari parameter API
+                resolved_type_slug = manga_info['detected_type_slug'] or type_slug
+
+                # ✨ BARU: Ambil MangaType dari DB sesuai resolved_type_slug
+                resolved_manga_type = self.db.query(MangaType).filter(
+                    MangaType.slug == resolved_type_slug
+                ).first()
+
+                if not resolved_manga_type:
+                    logger.warning(
+                        f"⚠️ Type '{resolved_type_slug}' tidak ditemukan di DB untuk manga "
+                        f"'{manga_info['title']}', fallback ke default '{type_slug}'"
+                    )
+                    resolved_manga_type = default_manga_type
+
                 result = await self._process_single_manga(
                     manga_info,
                     storage_id,
-                    manga_type.id,
+                    resolved_manga_type.id,
                     base_folder_id,
                     default_status,
                     uploader_id
@@ -505,7 +618,7 @@ class SmartBulkImportService:
                 "imported": len(successful),
                 "failed": len(results) - len(successful),
                 "total_alt_titles_added": total_alt_titles,  # ✨ BARU
-                "total_previews_uploaded": total_previews,  # ✨ BARU
+                "total_previews_uploaded": total_previews,   # ✨ BARU
                 "results": results,
                 "stats": {
                     "duration_seconds": round(duration, 2)
@@ -538,6 +651,7 @@ class SmartBulkImportService:
         ✅ Smart merge: hanya update field yang belum ada
         ✨ ENHANCED: Support alt titles & custom preview
         ✅ REVISI COVER: preserve format asli (jpg/png/webp)
+        ✨ REVISI TYPE: type_id sudah di-resolve per manga sebelum memanggil ini
         """
         from app.models.models import Manga, Genre, Chapter, MangaAltTitle
 
