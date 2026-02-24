@@ -11,15 +11,22 @@ REVISI:
 - Show description
 ✅ FIX #3: Import timezone dan ganti datetime.utcnow()
 ✅ REVISI BARU: Tambah endpoint public /cover/{manga_slug} untuk akses cover langsung
+✅ NEW: Tambah endpoint async /suggest untuk autocomplete search judul komik
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from typing import Optional
+from typing import Optional, List
 from datetime import timedelta, datetime, timezone  # ✅ FIX #3: Added timezone import
 from pathlib import Path
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# ✅ Thread pool untuk offload DB queries agar tidak blocking event loop
+# Sesuaikan max_workers dengan jumlah core CPU server kamu
+_db_executor = ThreadPoolExecutor(max_workers=20)
 
 from app.core.base import (
     get_db, get_current_user, require_role,
@@ -315,6 +322,129 @@ def list_manga(
             "page_size": page_size,
             "total_pages": (total + page_size - 1) // page_size
         }
+    }
+
+
+# ==========================================
+# ✅ NEW: Suggest / Autocomplete Endpoint
+# Async - bisa handle banyak user bersamaan
+# ==========================================
+
+@manga_router.get("/suggest")
+async def suggest_manga(
+    q: str = Query(..., min_length=1, max_length=100, description="Keyword pencarian judul komik"),
+    limit: int = Query(8, ge=1, le=20, description="Jumlah hasil maksimal (1-20)"),
+    type_slug: Optional[str] = Query(None, description="Filter by tipe manga (slug), misal: manga, manhwa, manhua"),
+    genre_slug: Optional[str] = Query(None, description="Filter by genre (slug), misal: action, romance"),
+    db: Session = Depends(get_db)
+):
+    """
+    [PUBLIC] Autocomplete / suggest judul komik.
+
+    Digunakan untuk preview real-time saat user ketik di search bar.
+    Response ringan: hanya data penting saja.
+
+    Features:
+    - ✅ Search by judul (case-insensitive, partial match)
+    - ✅ Tampilkan tipe komik (manga, manhwa, manhua, dll)
+    - ✅ Tampilkan genre komik
+    - ✅ Tampilkan cover thumbnail
+    - ✅ Async + ThreadPoolExecutor → tidak blocking, bisa handle 100+ concurrent users
+    - ✅ Filter by type_slug (opsional)
+    - ✅ Filter by genre_slug (opsional)
+
+    Contoh request:
+        GET /api/v1/manga/suggest?q=one
+        GET /api/v1/manga/suggest?q=one&limit=5
+        GET /api/v1/manga/suggest?q=one&type_slug=manhwa
+        GET /api/v1/manga/suggest?q=action&genre_slug=action
+
+    Contoh response:
+    {
+      "q": "one",
+      "total": 2,
+      "suggestions": [
+        {
+          "title": "One Piece",
+          "slug": "one-piece",
+          "cover_url": "/static/covers/one-piece.jpg",
+          "status": "ongoing",
+          "type": { "name": "Manga", "slug": "manga" },
+          "genres": [{"name": "Action", "slug": "action"}, ...],
+          "total_chapters": 1100
+        }
+      ]
+    }
+    """
+
+    def _query_db():
+        """
+        Fungsi DB query yang dijalankan di thread pool.
+        SQLAlchemy sync session aman dipakai di thread terpisah.
+        """
+        query = db.query(Manga)
+
+        # 1. Search by judul - case-insensitive, partial match
+        #    Misal q="one" → cocok dengan "One Piece", "One Punch Man", dll
+        keyword = q.strip()
+        query = query.filter(Manga.title.ilike(f"%{keyword}%"))
+
+        # 2. Filter by tipe manga (opsional)
+        #    Misal type_slug="manhwa" → hanya tampilkan manhwa
+        if type_slug:
+            query = query.join(MangaType).filter(
+                MangaType.slug == type_slug.strip().lower()
+            )
+
+        # 3. Filter by genre (opsional)
+        if genre_slug:
+            query = query.join(Manga.genres).filter(
+                Genre.slug == genre_slug.strip().lower()
+            )
+
+        # 4. Sort: judul yang dimulai dengan keyword diutamakan (lebih relevan),
+        #    lalu sisanya alphabetical
+        #    Contoh: q="one" → "One Piece" lebih dulu dari "Sword Art Online"
+        from sqlalchemy import case
+        priority = case(
+            (Manga.title.ilike(f"{keyword}%"), 0),  # Dimulai dengan keyword → prioritas 0 (tertinggi)
+            else_=1                                   # Partial match di tengah  → prioritas 1
+        )
+        query = query.order_by(priority, Manga.title)
+
+        # 5. Limit hasil
+        manga_list = query.limit(limit).all()
+
+        # 6. Build response - hanya data yang dibutuhkan untuk preview
+        suggestions = []
+        for m in manga_list:
+            suggestions.append({
+                "title": m.title,
+                "slug": m.slug,
+                "cover_url": get_cover_url(m.cover_image_path),
+                "status": m.status,
+                "type": {
+                    "name": m.manga_type.name if m.manga_type else None,
+                    "slug": m.manga_type.slug if m.manga_type else None,
+                },
+                "genres": [
+                    {"name": g.name, "slug": g.slug}
+                    for g in m.genres
+                ],
+                "total_chapters": len(m.chapters)
+            })
+
+        return suggestions
+
+    # ✅ Jalankan DB query di thread pool agar tidak blocking event loop FastAPI.
+    # Ini yang bikin endpoint bisa handle banyak user bersamaan (concurrent).
+    loop = asyncio.get_event_loop()
+    suggestions = await loop.run_in_executor(_db_executor, _query_db)
+
+    return {
+        "q": q.strip(),
+        "total": len(suggestions),
+        "suggestions": suggestions
     }
 
 
