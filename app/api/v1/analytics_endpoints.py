@@ -5,14 +5,24 @@ Analytics untuk admin: overview, manga views, user growth, popular genres
 
 ✅ FIX #3: Import timezone dan ganti semua datetime.utcnow()
 
-Endpoints:
-- /api/v1/admin/analytics/overview - Dashboard overview
-- /api/v1/admin/analytics/manga-views - Manga views statistics
-- /api/v1/admin/analytics/user-growth - User registration trend
-- /api/v1/admin/analytics/popular-genres - Most popular genres
+Endpoints (GET):
+- /api/v1/admin/analytics/overview          - Dashboard overview
+- /api/v1/admin/analytics/manga-views       - Manga views statistics
+- /api/v1/admin/analytics/user-growth       - User registration trend
+- /api/v1/admin/analytics/popular-genres    - Most popular genres
+- /api/v1/admin/analytics/top-manga         - Top manga by metrics
+- /api/v1/admin/analytics/recent-activity   - Recent user activity
+
+Endpoints (DELETE / Pruning):
+- /api/v1/admin/analytics/manga-views                       - Delete by period
+- /api/v1/admin/analytics/manga-views/manga/{manga_id}      - Delete by manga
+- /api/v1/admin/analytics/manga-views/all                   - Delete all (confirm=true)
+- /api/v1/admin/analytics/chapter-views                     - Delete by period
+- /api/v1/admin/analytics/chapter-views/chapter/{chapter_id} - Delete by chapter
+- /api/v1/admin/analytics/chapter-views/all                 - Delete all (confirm=true)
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, and_
 from typing import Optional
@@ -521,4 +531,236 @@ def get_recent_activity(
     
     return {
         "recent_activity": all_activity[:limit]
+    }
+
+
+# ==========================================
+# VIEWS CLEANUP / PRUNING ENDPOINTS
+# ==========================================
+
+@analytics_router.delete("/manga-views")
+def delete_manga_views_by_period(
+    older_than_days: int = Query(30, ge=1, le=3650, description="Hapus views lebih tua dari N hari"),
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus manga views yang lebih tua dari N hari.
+
+    Berguna untuk pruning/cleanup tabel manga_views agar tidak terlalu besar.
+    Default: hapus views yang lebih tua dari 30 hari.
+
+    Contoh:
+        DELETE /api/v1/admin/analytics/manga-views?older_than_days=90
+        → Hapus semua manga views yang berumur > 90 hari
+    """
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+
+    deleted_count = db.query(MangaView).filter(
+        MangaView.viewed_at < cutoff_date
+    ).delete(synchronize_session=False)
+
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} deleted {deleted_count} manga views "
+        f"older than {older_than_days} days (cutoff: {cutoff_date.date()})"
+    )
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "message": f"Deleted {deleted_count} manga views older than {older_than_days} days",
+        "cutoff_date": cutoff_date.isoformat()
+    }
+
+
+@analytics_router.delete("/manga-views/manga/{manga_id}")
+def delete_manga_views_by_manga(
+    manga_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus semua views untuk satu manga tertentu.
+
+    Berguna untuk reset view count suatu manga (misalnya setelah migrasi data
+    atau saat ada view spam pada manga tertentu).
+
+    Args:
+        manga_id: ID manga yang views-nya ingin dihapus
+    """
+    # Validasi manga ada
+    manga = db.query(Manga).filter(Manga.id == manga_id).first()
+    if not manga:
+        raise HTTPException(status_code=404, detail=f"Manga ID {manga_id} tidak ditemukan")
+
+    deleted_count = db.query(MangaView).filter(
+        MangaView.manga_id == manga_id
+    ).delete(synchronize_session=False)
+
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} deleted {deleted_count} views "
+        f"for manga '{manga.title}' (ID: {manga_id})"
+    )
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "manga_id": manga_id,
+        "manga_title": manga.title,
+        "manga_slug": manga.slug,
+        "message": f"Deleted {deleted_count} views for manga '{manga.title}'"
+    }
+
+
+@analytics_router.delete("/manga-views/all")
+def delete_all_manga_views(
+    confirm: bool = Query(False, description="Harus True untuk konfirmasi hapus semua data"),
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus SEMUA data manga views.
+
+    ⚠️ BERBAHAYA: Aksi ini tidak bisa dibatalkan!
+    Wajib sertakan query param `confirm=true` sebagai konfirmasi.
+
+    Contoh:
+        DELETE /api/v1/admin/analytics/manga-views/all?confirm=true
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Tambahkan query param '?confirm=true' untuk konfirmasi. "
+                   "Aksi ini akan menghapus SEMUA data manga views dan tidak bisa dibatalkan."
+        )
+
+    deleted_count = db.query(MangaView).delete(synchronize_session=False)
+    db.commit()
+
+    logger.warning(
+        f"Admin {current_user.username} DELETED ALL manga views: {deleted_count} rows removed"
+    )
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "message": f"Deleted ALL {deleted_count} manga views from database"
+    }
+
+
+@analytics_router.delete("/chapter-views")
+def delete_chapter_views_by_period(
+    older_than_days: int = Query(30, ge=1, le=3650, description="Hapus views lebih tua dari N hari"),
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus chapter views yang lebih tua dari N hari.
+
+    Berguna untuk pruning/cleanup tabel chapter_views agar tidak terlalu besar.
+    Default: hapus views yang lebih tua dari 30 hari.
+
+    Contoh:
+        DELETE /api/v1/admin/analytics/chapter-views?older_than_days=90
+        → Hapus semua chapter views yang berumur > 90 hari
+    """
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+
+    deleted_count = db.query(ChapterView).filter(
+        ChapterView.viewed_at < cutoff_date
+    ).delete(synchronize_session=False)
+
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} deleted {deleted_count} chapter views "
+        f"older than {older_than_days} days (cutoff: {cutoff_date.date()})"
+    )
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "message": f"Deleted {deleted_count} chapter views older than {older_than_days} days",
+        "cutoff_date": cutoff_date.isoformat()
+    }
+
+
+@analytics_router.delete("/chapter-views/chapter/{chapter_id}")
+def delete_chapter_views_by_chapter(
+    chapter_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus semua views untuk satu chapter tertentu.
+
+    Berguna untuk reset view count suatu chapter.
+
+    Args:
+        chapter_id: ID chapter yang views-nya ingin dihapus
+    """
+    # Validasi chapter ada
+    chapter = db.query(Chapter).filter(Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail=f"Chapter ID {chapter_id} tidak ditemukan")
+
+    deleted_count = db.query(ChapterView).filter(
+        ChapterView.chapter_id == chapter_id
+    ).delete(synchronize_session=False)
+
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} deleted {deleted_count} views "
+        f"for chapter '{chapter.chapter_label}' (ID: {chapter_id})"
+    )
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "chapter_id": chapter_id,
+        "chapter_label": chapter.chapter_label,
+        "chapter_slug": chapter.slug,
+        "manga_id": chapter.manga_id,
+        "message": f"Deleted {deleted_count} views for chapter '{chapter.chapter_label}'"
+    }
+
+
+@analytics_router.delete("/chapter-views/all")
+def delete_all_chapter_views(
+    confirm: bool = Query(False, description="Harus True untuk konfirmasi hapus semua data"),
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus SEMUA data chapter views.
+
+    ⚠️ BERBAHAYA: Aksi ini tidak bisa dibatalkan!
+    Wajib sertakan query param `confirm=true` sebagai konfirmasi.
+
+    Contoh:
+        DELETE /api/v1/admin/analytics/chapter-views/all?confirm=true
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Tambahkan query param '?confirm=true' untuk konfirmasi. "
+                   "Aksi ini akan menghapus SEMUA data chapter views dan tidak bisa dibatalkan."
+        )
+
+    deleted_count = db.query(ChapterView).delete(synchronize_session=False)
+    db.commit()
+
+    logger.warning(
+        f"Admin {current_user.username} DELETED ALL chapter views: {deleted_count} rows removed"
+    )
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "message": f"Deleted ALL {deleted_count} chapter views from database"
     }

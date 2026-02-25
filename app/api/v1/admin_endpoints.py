@@ -61,7 +61,9 @@ from app.services.thumbnail_service import ThumbnailService
 
 from app.schemas.schemas import (
     MangaUpdateRequest, ChapterUpdateRequest,
-    UserRoleUpdateRequest, UserStatusUpdateRequest
+    UserRoleUpdateRequest, UserStatusUpdateRequest,
+    AdminChangeUsernameRequest, AdminChangePasswordRequest, AdminChangeEmailRequest,
+    PageSwapRequest, PageReorderRequest
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,37 @@ def get_multi_remote_service():
         )
 
     return main.multi_remote_service
+
+
+def _get_active_group_info() -> dict:
+    """
+    Helper: Get info active upload group dari MultiRemoteService.
+
+    Returns dict dengan:
+    - group: int (1 atau 2)
+    - primary_remote: str (nama rclone remote)
+    - path_prefix: str ("@" jika group 2, "" jika group 1)
+    """
+    try:
+        from app.services.upload_service import UploadService
+        svc = UploadService()
+        group, remote_name, _ = svc._get_active_group_rclone()
+        path_prefix = settings.GROUP2_PATH_PREFIX if group == 2 else ""
+        return {
+            "group": group,
+            "primary_remote": remote_name,
+            "path_prefix": path_prefix,
+        }
+    except Exception as e:
+        logger.warning(f"Failed to get active group info, fallback to group 1: {e}")
+        # Fallback ke primary remote dari settings
+        remotes = settings.get_primary_remotes()
+        remote_name = remotes[0] if remotes else settings.RCLONE_REMOTE_NAME
+        return {
+            "group": 1,
+            "primary_remote": remote_name,
+            "path_prefix": "",
+        }
 
 
 # ==========================================
@@ -893,6 +926,57 @@ def admin_list_chapters(
     }
 
 
+@admin_router.get("/chapter/{chapter_id}")
+def admin_get_chapter_detail(
+    chapter_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Get detail chapter by ID.
+
+    Mengembalikan informasi chapter beserta daftar halaman (pages)
+    lengkap dengan proxy_url untuk preview gambar.
+    """
+    chapter = db.query(Chapter).filter(Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail=f"Chapter ID {chapter_id} tidak ditemukan")
+
+    manga = chapter.manga
+    sorted_pages = sorted(chapter.pages, key=lambda p: p.page_order)
+
+    return {
+        "id": chapter.id,
+        "manga_id": chapter.manga_id,
+        "chapter_main": chapter.chapter_main,
+        "chapter_sub": chapter.chapter_sub,
+        "chapter_label": chapter.chapter_label,
+        "slug": chapter.slug,
+        "chapter_folder_name": chapter.chapter_folder_name,
+        "volume_number": chapter.volume_number,
+        "anchor_path": chapter.anchor_path,
+        "preview_url": chapter.preview_url,
+        "total_pages": len(chapter.pages),
+        "uploaded_by": chapter.uploader.username if chapter.uploader else None,
+        "created_at": chapter.created_at,
+        "manga": {
+            "id": manga.id,
+            "title": manga.title,
+            "slug": manga.slug
+        } if manga else None,
+        "pages": [
+            {
+                "id": page.id,
+                "page_order": page.page_order,
+                "gdrive_file_id": page.gdrive_file_id,
+                "is_anchor": page.is_anchor,
+                "proxy_url": f"/api/v1/image-proxy/image/{page.gdrive_file_id}"
+            }
+            for page in sorted_pages
+        ]
+    }
+
+
 @admin_router.put("/chapter/{chapter_id}")
 def admin_update_chapter(
     chapter_id: int,
@@ -982,6 +1066,826 @@ def admin_delete_chapter(
         "deleted_chapter_id": chapter_id,
         "cache_cleared": cleared_cache,
         "gdrive_folder_deleted": gdrive_deleted
+    }
+
+
+# ==========================================
+# PAGE REORDER
+# ==========================================
+
+@admin_router.post("/chapter/{chapter_id}/pages/swap")
+def admin_swap_pages(
+    chapter_id: int,
+    data: PageSwapRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Swap urutan 2 halaman dalam chapter.
+
+    Menukar nilai page_order antara 2 halaman.
+    Tidak ada perubahan di Google Drive — hanya update di database.
+
+    Contoh:
+        page_id_1=10 (order=2), page_id_2=50 (order=8)
+        Page 10 jadi order=8, Page 50 jadi order=2
+    """
+    chapter = db.query(Chapter).filter(Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail=f"Chapter ID {chapter_id} tidak ditemukan")
+
+    page1 = db.query(Page).filter(
+        Page.id == data.page_id_1, Page.chapter_id == chapter_id
+    ).first()
+    if not page1:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page ID {data.page_id_1} tidak ditemukan di Chapter ID {chapter_id}"
+        )
+
+    page2 = db.query(Page).filter(
+        Page.id == data.page_id_2, Page.chapter_id == chapter_id
+    ).first()
+    if not page2:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page ID {data.page_id_2} tidak ditemukan di Chapter ID {chapter_id}"
+        )
+
+    if page1.id == page2.id:
+        raise HTTPException(status_code=400, detail="Tidak bisa swap page dengan dirinya sendiri")
+
+    old_order_1 = page1.page_order
+    old_order_2 = page2.page_order
+
+    # Gunakan nilai negatif sementara agar tidak bentrok constraint
+    page1.page_order = -1
+    db.flush()
+    page2.page_order = old_order_1
+    db.flush()
+    page1.page_order = old_order_2
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} swapped pages in Chapter {chapter_id} "
+        f"('{chapter.chapter_label}'): "
+        f"Page {data.page_id_1} {old_order_1}<>{old_order_2} Page {data.page_id_2}"
+    )
+
+    return {
+        "success": True,
+        "chapter_id": chapter_id,
+        "chapter_label": chapter.chapter_label,
+        "swapped": [
+            {
+                "page_id": page1.id,
+                "gdrive_file_id": page1.gdrive_file_id,
+                "old_order": old_order_1,
+                "new_order": page1.page_order
+            },
+            {
+                "page_id": page2.id,
+                "gdrive_file_id": page2.gdrive_file_id,
+                "old_order": old_order_2,
+                "new_order": page2.page_order
+            }
+        ],
+        "message": f"Berhasil swap halaman order {old_order_1} <> {old_order_2}"
+    }
+
+
+@admin_router.put("/chapter/{chapter_id}/pages/reorder")
+def admin_reorder_pages(
+    chapter_id: int,
+    data: PageReorderRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Bulk reorder semua halaman chapter (untuk drag & drop frontend).
+
+    Menerima array urutan baru untuk SEMUA halaman.
+    Tidak ada perubahan di Google Drive, hanya update page_order di database.
+
+    Validasi:
+    - Semua page_id harus milik chapter ini
+    - new_order tidak boleh duplikat
+    - new_order harus berurutan dari 1 sampai N (total halaman)
+    - Jumlah item dalam request harus sama dengan total halaman
+
+    Contoh body:
+    {
+      "page_orders": [
+        {"page_id": 10, "new_order": 1},
+        {"page_id": 5,  "new_order": 2},
+        {"page_id": 8,  "new_order": 3}
+      ]
+    }
+    """
+    chapter = db.query(Chapter).filter(Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail=f"Chapter ID {chapter_id} tidak ditemukan")
+
+    total_pages = db.query(Page).filter(Page.chapter_id == chapter_id).count()
+
+    if total_pages == 0:
+        raise HTTPException(status_code=400, detail="Chapter tidak memiliki halaman")
+
+    if len(data.page_orders) != total_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Jumlah page dalam request ({len(data.page_orders)}) "
+                   f"tidak sama dengan total halaman chapter ({total_pages}). "
+                   f"Semua halaman harus disertakan."
+        )
+
+    new_orders = [item.new_order for item in data.page_orders]
+    if len(new_orders) != len(set(new_orders)):
+        raise HTTPException(status_code=400, detail="new_order tidak boleh duplikat")
+
+    expected_orders = set(range(1, total_pages + 1))
+    if set(new_orders) != expected_orders:
+        raise HTTPException(
+            status_code=400,
+            detail=f"new_order harus berurutan dari 1 sampai {total_pages}. "
+                   f"Diterima: {sorted(new_orders)}"
+        )
+
+    request_page_ids = [item.page_id for item in data.page_orders]
+    pages = db.query(Page).filter(
+        Page.chapter_id == chapter_id,
+        Page.id.in_(request_page_ids)
+    ).all()
+
+    found_ids = {p.id for p in pages}
+    missing_ids = set(request_page_ids) - found_ids
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page ID tidak ditemukan di Chapter {chapter_id}: {sorted(missing_ids)}"
+        )
+
+    order_map = {item.page_id: item.new_order for item in data.page_orders}
+
+    # Step 1: set semua ke negatif dulu (hindari conflict constraint)
+    for page in pages:
+        page.page_order = -(page.page_order)
+    db.flush()
+
+    # Step 2: terapkan urutan baru
+    for page in pages:
+        page.page_order = order_map[page.id]
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} reordered {len(pages)} pages "
+        f"in Chapter {chapter_id} ('{chapter.chapter_label}')"
+    )
+
+    result_pages = sorted(
+        [
+            {
+                "page_id": p.id,
+                "gdrive_file_id": p.gdrive_file_id,
+                "new_order": p.page_order
+            }
+            for p in pages
+        ],
+        key=lambda x: x["new_order"]
+    )
+
+    return {
+        "success": True,
+        "chapter_id": chapter_id,
+        "chapter_label": chapter.chapter_label,
+        "total_pages_reordered": len(pages),
+        "pages": result_pages,
+        "message": f"Berhasil reorder {len(pages)} halaman di '{chapter.chapter_label}'"
+    }
+
+
+# ==========================================
+# PAGE ADD / DELETE (rclone required)
+# ==========================================
+
+@admin_router.post("/chapter/{chapter_id}/pages/add")
+async def admin_add_pages(
+    chapter_id: int,
+    files: List[UploadFile] = File(..., description="Image files baru yang akan ditambahkan"),
+    insert_after: Optional[int] = Query(
+        None,
+        description="Sisipkan setelah page_order ini. None = tambah di akhir"
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Tambah gambar baru ke chapter yang sudah ada.
+
+    Upload file gambar ke Google Drive (folder chapter existing),
+    buat Page record, dan geser page_order halaman berikutnya.
+
+    Parameter:
+    - **files**: Satu atau lebih file gambar (JPG/PNG/WEBP)
+    - **insert_after**: Sisipkan setelah page_order N.
+      - None (default) = tambah di akhir chapter
+      - 0 = jadikan halaman pertama
+      - 5 = sisipkan setelah halaman ke-5
+
+    Contoh:
+        Chapter punya 10 halaman.
+        Upload 2 file dengan insert_after=5
+        Hasilnya: halaman baru → order 6,7. Halaman lama 6-10 → 8-12.
+    """
+    from app.services.upload_service import UploadService
+    import tempfile, os
+
+    chapter = db.query(Chapter).filter(Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail=f"Chapter ID {chapter_id} tidak ditemukan")
+
+    manga = chapter.manga
+    if not manga:
+        raise HTTPException(status_code=500, detail="Manga untuk chapter ini tidak ditemukan")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="Minimal 1 file diperlukan")
+
+    existing_pages = db.query(Page).filter(
+        Page.chapter_id == chapter_id
+    ).order_by(Page.page_order).all()
+    total_existing = len(existing_pages)
+
+    if insert_after is not None and insert_after > total_existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"insert_after={insert_after} melebihi total halaman ({total_existing})"
+        )
+
+    file_list = []
+    for upload_file in files:
+        content = await upload_file.read()
+        file_list.append((content, upload_file.filename))
+
+    try:
+        n_new = len(file_list)
+
+        # Tentukan page_order awal untuk halaman baru
+        if insert_after is None:
+            start_order = total_existing + 1
+        else:
+            start_order = insert_after + 1
+
+        # Geser page_order yang tergeser (jika sisip di tengah)
+        if insert_after is not None and insert_after < total_existing:
+            pages_to_shift = [p for p in existing_pages if p.page_order >= start_order]
+            for p in pages_to_shift:
+                p.page_order = -(p.page_order)
+            db.flush()
+            for p in pages_to_shift:
+                p.page_order = (-p.page_order) + n_new
+            db.flush()
+
+        # Ambil info active group
+        group_info = _get_active_group_info()
+        active_group = group_info["group"]
+        path_prefix = group_info["path_prefix"]
+        primary_remote = group_info["primary_remote"]
+
+        from app.services.rclone_service import RcloneService
+        rclone = RcloneService(remote_name=primary_remote)
+
+        # Folder GDrive chapter (tanpa prefix @)
+        gdrive_folder = (
+            f"{manga.storage_source.base_folder_id}/"
+            f"{manga.slug}/{chapter.chapter_folder_name}"
+        )
+        clean_folder = gdrive_folder.lstrip("@")
+
+        # Hitung file number mulai dari max yang sudah ada + 1
+        max_order = max((p.page_order for p in existing_pages), default=0)
+
+        temp_paths = []
+        uploaded_pages = []
+
+        for idx, (content, filename) in enumerate(file_list):
+            order_num = start_order + idx
+            ext = os.path.splitext(filename)[1].lower() or ".jpg"
+            target_name = f"{max_order + idx + 1:03d}{ext}"
+            gdrive_path_clean = f"{clean_folder}/{target_name}"
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            temp_paths.append(tmp_path)
+
+            result = rclone._run_command([
+                "copyto", tmp_path,
+                f"{primary_remote}:{gdrive_path_clean}",
+                "--progress"
+            ], timeout=120)
+
+            if result.returncode != 0:
+                for tp in temp_paths:
+                    try: os.unlink(tp)
+                    except: pass
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gagal upload {filename} ke GDrive: {result.stderr}"
+                )
+
+            db_path = f"{path_prefix}{gdrive_path_clean}" if path_prefix else gdrive_path_clean
+
+            new_page = Page(
+                chapter_id=chapter_id,
+                gdrive_file_id=db_path,
+                page_order=order_num,
+                is_anchor=False
+            )
+            db.add(new_page)
+            uploaded_pages.append({
+                "page_order": order_num,
+                "gdrive_file_id": db_path,
+                "original_filename": filename
+            })
+
+        for tp in temp_paths:
+            try: os.unlink(tp)
+            except: pass
+
+        db.commit()
+        total_after = db.query(Page).filter(Page.chapter_id == chapter_id).count()
+
+        logger.info(
+            f"Admin {current_user.username} added {n_new} pages to Chapter {chapter_id} "
+            f"('{chapter.chapter_label}'), insert_after={insert_after}"
+        )
+
+        return {
+            "success": True,
+            "chapter_id": chapter_id,
+            "chapter_label": chapter.chapter_label,
+            "pages_added": n_new,
+            "insert_after": insert_after,
+            "total_pages_before": total_existing,
+            "total_pages_after": total_after,
+            "uploaded_pages": uploaded_pages,
+            "storage_group": active_group,
+            "message": f"Berhasil menambahkan {n_new} halaman ke '{chapter.chapter_label}'"
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to add pages to chapter {chapter_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Gagal menambahkan halaman: {str(e)}")
+
+
+@admin_router.delete("/chapter/{chapter_id}/pages/{page_id}")
+def admin_delete_page(
+    chapter_id: int,
+    page_id: int,
+    delete_from_gdrive: bool = Query(
+        True,
+        description="True = hapus file fisik dari Google Drive via rclone"
+    ),
+    renumber: bool = Query(
+        True,
+        description="True = renumber page_order setelah delete agar tetap berurutan"
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus satu halaman dari chapter.
+
+    Secara default menghapus file fisik dari Google Drive via rclone,
+    lalu menghapus Page record dari database.
+
+    Parameter:
+    - **delete_from_gdrive**: Default True. Set False jika file GDrive sudah tidak ada
+    - **renumber**: Default True. Renumber agar page_order tetap berurutan.
+      Contoh: 1,2,4,5 → 1,2,3,4
+
+    Catatan:
+    - Chapter harus punya minimal 1 halaman setelah delete
+    - Jika halaman yang dihapus adalah anchor/thumbnail chapter,
+      anchor otomatis pindah ke halaman pertama
+    """
+    from app.services.rclone_service import RcloneService
+
+    chapter = db.query(Chapter).filter(Chapter.id == chapter_id).first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail=f"Chapter ID {chapter_id} tidak ditemukan")
+
+    page = db.query(Page).filter(
+        Page.id == page_id,
+        Page.chapter_id == chapter_id
+    ).first()
+    if not page:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page ID {page_id} tidak ditemukan di Chapter ID {chapter_id}"
+        )
+
+    total_pages = db.query(Page).filter(Page.chapter_id == chapter_id).count()
+    if total_pages <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Tidak bisa menghapus halaman terakhir. Chapter harus punya minimal 1 halaman."
+        )
+
+    deleted_order = page.page_order
+    deleted_gdrive_path = page.gdrive_file_id
+    gdrive_deleted = False
+
+    # Hapus file dari GDrive via rclone
+    if delete_from_gdrive:
+        try:
+            group_info = _get_active_group_info()
+            rclone = RcloneService(remote_name=group_info["primary_remote"])
+            # Hapus prefix @ jika ada (group 2 path)
+            clean_path = deleted_gdrive_path.lstrip("@")
+            gdrive_deleted = rclone.delete_path(clean_path, is_directory=False)
+            if not gdrive_deleted:
+                logger.warning(
+                    f"GDrive delete failed for {clean_path}, continuing with DB delete"
+                )
+        except Exception as e:
+            logger.error(f"Error deleting from GDrive: {str(e)}")
+
+    # Hapus dari DB
+    db.delete(page)
+    db.flush()
+
+    # Update anchor jika page yang dihapus adalah anchor chapter
+    if chapter.anchor_path == deleted_gdrive_path:
+        first_remaining = db.query(Page).filter(
+            Page.chapter_id == chapter_id
+        ).order_by(Page.page_order.asc()).first()
+
+        if first_remaining:
+            chapter.anchor_path = first_remaining.gdrive_file_id
+            chapter.preview_url = f"/api/v1/image-proxy/image/{first_remaining.gdrive_file_id}"
+        else:
+            chapter.anchor_path = None
+            chapter.preview_url = None
+
+    # Renumber: geser page_order pages setelah yang dihapus turun 1
+    if renumber:
+        remaining = db.query(Page).filter(
+            Page.chapter_id == chapter_id,
+            Page.page_order > deleted_order
+        ).order_by(Page.page_order.asc()).all()
+
+        for p in remaining:
+            p.page_order -= 1
+
+    db.commit()
+    total_after = db.query(Page).filter(Page.chapter_id == chapter_id).count()
+
+    logger.info(
+        f"Admin {current_user.username} deleted page ID {page_id} "
+        f"(order {deleted_order}) from Chapter {chapter_id} ('{chapter.chapter_label}'). "
+        f"GDrive deleted: {gdrive_deleted}, Renumbered: {renumber}"
+    )
+
+    return {
+        "success": True,
+        "chapter_id": chapter_id,
+        "chapter_label": chapter.chapter_label,
+        "deleted_page_id": page_id,
+        "deleted_page_order": deleted_order,
+        "deleted_gdrive_path": deleted_gdrive_path,
+        "gdrive_file_deleted": gdrive_deleted,
+        "renumbered": renumber,
+        "total_pages_before": total_pages,
+        "total_pages_after": total_after,
+        "message": f"Halaman order {deleted_order} berhasil dihapus dari '{chapter.chapter_label}'"
+    }
+
+
+# ==========================================
+# USER MANAGEMENT
+# ==========================================
+
+@admin_router.get("/users")
+def admin_list_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = Query(None, description="Cari berdasarkan username atau email"),
+    is_active: Optional[bool] = Query(None, description="Filter: True=aktif, False=nonaktif"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """[ADMIN] List semua user dengan filter dan pagination."""
+    query = db.query(User)
+
+    if search:
+        safe_search = search.replace("%", r"\%").replace("_", r"\_")
+        query = query.filter(
+            (User.username.ilike(f"%{safe_search}%", escape="\\")) |
+            (User.email.ilike(f"%{safe_search}%", escape="\\"))
+        )
+
+    if is_active is not None:
+        query = query.filter(User.is_active == is_active)
+
+    total = query.count()
+    users = query.order_by(User.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+
+    items = []
+    for u in users:
+        items.append({
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "is_active": u.is_active,
+            "roles": [r.name for r in u.roles],
+            "total_uploads": len(u.chapters),
+            "created_at": u.created_at,
+            "last_login": u.last_login
+        })
+
+    return {
+        "items": items,
+        "pagination": {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total + page_size - 1) // page_size
+        }
+    }
+
+
+@admin_router.get("/users/{user_id}")
+def admin_get_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """[ADMIN] Get detail user by ID."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} tidak ditemukan")
+
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_active": user.is_active,
+        "roles": [r.name for r in user.roles],
+        "total_uploads": len(user.chapters),
+        "created_at": user.created_at,
+        "last_login": user.last_login
+    }
+
+
+@admin_router.patch("/users/{user_id}/username")
+def admin_change_username(
+    user_id: int,
+    data: AdminChangeUsernameRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Ganti username user.
+
+    Validasi:
+    - Username baru harus unik (tidak boleh sama dengan user lain)
+    - Panjang 3-50 karakter
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} tidak ditemukan")
+
+    # Cek uniqueness
+    existing = db.query(User).filter(
+        User.username == data.new_username,
+        User.id != user_id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Username '{data.new_username}' sudah digunakan")
+
+    old_username = user.username
+    user.username = data.new_username
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} changed username for User ID {user_id}: "
+        f"'{old_username}' → '{data.new_username}'"
+    )
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "old_username": old_username,
+        "new_username": user.username,
+        "message": f"Username berhasil diubah menjadi '{user.username}'"
+    }
+
+
+@admin_router.patch("/users/{user_id}/password")
+def admin_change_password(
+    user_id: int,
+    data: AdminChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Reset password user.
+
+    Admin tidak perlu tahu password lama.
+    Password baru langsung di-hash dan disimpan.
+    Minimal 6 karakter.
+    """
+    from app.core.base import get_password_hash
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} tidak ditemukan")
+
+    user.password_hash = get_password_hash(data.new_password)
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} reset password for User ID {user_id} ({user.username})"
+    )
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "username": user.username,
+        "message": f"Password user '{user.username}' berhasil direset"
+    }
+
+
+@admin_router.patch("/users/{user_id}/email")
+def admin_change_email(
+    user_id: int,
+    data: AdminChangeEmailRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Ganti email user.
+
+    Validasi:
+    - Format email harus valid
+    - Email baru harus unik
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} tidak ditemukan")
+
+    # Cek uniqueness
+    existing = db.query(User).filter(
+        User.email == str(data.new_email),
+        User.id != user_id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Email '{data.new_email}' sudah digunakan")
+
+    old_email = user.email
+    user.email = str(data.new_email)
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} changed email for User ID {user_id} ({user.username}): "
+        f"'{old_email}' → '{data.new_email}'"
+    )
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "username": user.username,
+        "old_email": old_email,
+        "new_email": user.email,
+        "message": f"Email user '{user.username}' berhasil diubah"
+    }
+
+
+@admin_router.patch("/users/{user_id}/role")
+def admin_update_user_role(
+    user_id: int,
+    data: UserRoleUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Update roles user.
+
+    Set roles user ke daftar yang ditentukan.
+    Roles yang tersedia: 'user', 'admin', 'moderator' (sesuai database).
+    """
+    from app.models.models import Role
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} tidak ditemukan")
+
+    # Cegah admin hapus role dirinya sendiri
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Admin tidak bisa mengubah role dirinya sendiri")
+
+    roles = db.query(Role).filter(Role.name.in_(data.roles)).all()
+    found_role_names = {r.name for r in roles}
+    missing = set(data.roles) - found_role_names
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Role tidak ditemukan: {', '.join(missing)}")
+
+    old_roles = [r.name for r in user.roles]
+    user.roles = roles
+    db.commit()
+
+    logger.info(
+        f"Admin {current_user.username} updated roles for User ID {user_id} ({user.username}): "
+        f"{old_roles} → {data.roles}"
+    )
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "username": user.username,
+        "old_roles": old_roles,
+        "new_roles": [r.name for r in user.roles],
+        "message": f"Role user '{user.username}' berhasil diupdate"
+    }
+
+
+@admin_router.patch("/users/{user_id}/status")
+def admin_toggle_user_status(
+    user_id: int,
+    data: UserStatusUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Aktifkan atau nonaktifkan user.
+
+    User yang nonaktif tidak bisa login.
+    Admin tidak bisa menonaktifkan dirinya sendiri.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} tidak ditemukan")
+
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Admin tidak bisa menonaktifkan dirinya sendiri")
+
+    old_status = user.is_active
+    user.is_active = data.is_active
+    db.commit()
+
+    action = "diaktifkan" if data.is_active else "dinonaktifkan"
+    logger.info(
+        f"Admin {current_user.username} {action} User ID {user_id} ({user.username})"
+    )
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "username": user.username,
+        "old_status": old_status,
+        "new_status": user.is_active,
+        "message": f"User '{user.username}' berhasil {action}"
+    }
+
+
+@admin_router.delete("/users/{user_id}")
+def admin_delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Hapus user permanen dari database.
+
+    ⚠️ Data user (reading history, bookmarks, dll) akan ikut terhapus (cascade).
+    Admin tidak bisa menghapus dirinya sendiri.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} tidak ditemukan")
+
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Admin tidak bisa menghapus akunnya sendiri")
+
+    username = user.username
+    db.delete(user)
+    db.commit()
+
+    logger.warning(
+        f"Admin {current_user.username} DELETED User ID {user_id} ({username})"
+    )
+
+    return {
+        "success": True,
+        "deleted_user_id": user_id,
+        "deleted_username": username,
+        "message": f"User '{username}' berhasil dihapus"
     }
 
 

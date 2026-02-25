@@ -312,6 +312,43 @@ class UserStatusUpdateRequest(BaseModel):
     is_active: bool
 
 
+class AdminChangeUsernameRequest(BaseModel):
+    """Schema untuk admin ganti username user."""
+    new_username: str = Field(..., min_length=3, max_length=50, description="Username baru (3-50 karakter)")
+
+
+class AdminChangePasswordRequest(BaseModel):
+    """Schema untuk admin reset password user."""
+    new_password: str = Field(..., min_length=6, max_length=128, description="Password baru (min 6 karakter)")
+
+
+class AdminChangeEmailRequest(BaseModel):
+    """Schema untuk admin ganti email user."""
+    new_email: EmailStr = Field(..., description="Email baru")
+
+
+class PageSwapRequest(BaseModel):
+    """Schema untuk swap urutan 2 halaman chapter."""
+    page_id_1: int = Field(..., description="ID page pertama")
+    page_id_2: int = Field(..., description="ID page kedua yang akan ditukar posisinya")
+
+
+class PageOrderItem(BaseModel):
+    """Item urutan halaman untuk bulk reorder."""
+    page_id: int = Field(..., description="ID page")
+    new_order: int = Field(..., ge=1, description="Urutan baru (mulai dari 1)")
+
+
+class PageReorderRequest(BaseModel):
+    """Schema untuk bulk reorder halaman chapter (drag & drop)."""
+    page_orders: List[PageOrderItem] = Field(
+        ...,
+        min_items=2,
+        description="List page_id beserta urutan barunya. Harus mencakup semua halaman chapter."
+    )
+
+
+
 class AdminUserResponse(BaseModel):
     id: int
     username: str
