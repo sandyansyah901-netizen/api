@@ -45,6 +45,7 @@ import logging
 import httpx
 
 from app.core.base import get_db, get_current_user, require_role, settings
+from app.utils.slug_utils import normalize_slug
 from app.models.models import (
     User, Role, Manga, MangaType, Genre, Chapter, Page,
     StorageSource, ImageCache
@@ -333,6 +334,7 @@ def admin_create_manga(
 ):
     """[ADMIN] Create manga baru"""
     try:
+        slug = normalize_slug(slug)
         existing = db.query(Manga).filter(Manga.slug == slug).first()
         if existing:
             raise HTTPException(
@@ -618,6 +620,7 @@ async def admin_upload_cover(
     manga_id: int,
     cover_file: UploadFile = File(...),
     backup_to_gdrive: bool = Query(True, description="Backup ke Google Drive"),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin"))
 ):
@@ -625,8 +628,11 @@ async def admin_upload_cover(
     [ADMIN] Upload cover image untuk manga.
 
     ✅ FIX: Sekarang preserve format asli (jpg/png/webp) saat menyimpan.
-    Sebelumnya selalu disimpan sebagai .jpg meskipun upload .webp atau .png.
+    ✅ FIX CONCURRENCY: save_cover_local offloaded ke thread pool,
+       GDrive backup jalan di background task (response langsung balik).
     """
+    import asyncio
+
     manga = db.query(Manga).filter(Manga.id == manga_id).first()
     if not manga:
         raise HTTPException(status_code=404, detail=f"Manga ID {manga_id} tidak ditemukan")
@@ -643,24 +649,33 @@ async def admin_upload_cover(
     if not is_valid:
         raise HTTPException(status_code=400, detail=error_msg)
 
-    # ✅ FIX: Pass source_filename agar CoverService preserve format asli
-    local_path = cover_service.save_cover_local(
-        file_content,
-        manga.slug,
-        optimize=True,
-        source_filename=cover_file.filename  # ✅ NEW: preserve jpg/png/webp
+    # ✅ FIX CONCURRENCY: Offload blocking file I/O + PIL ke thread pool
+    loop = asyncio.get_event_loop()
+    source_filename = cover_file.filename
+    manga_slug = manga.slug
+    local_path = await loop.run_in_executor(
+        None,
+        lambda: cover_service.save_cover_local(
+            file_content,
+            manga_slug,
+            optimize=True,
+            source_filename=source_filename
+        )
     )
 
     if not local_path:
         raise HTTPException(status_code=500, detail="Failed to save cover locally")
 
-    backup_success = False
-    if backup_to_gdrive:
-        backup_success = cover_service.backup_cover_to_gdrive(local_path, manga.slug)
-
+    # Update DB langsung → response cepat
     manga.cover_image_path = local_path
     db.commit()
     db.refresh(manga)
+
+    # ✅ FIX CONCURRENCY: GDrive backup jalan di background — user TIDAK perlu nunggu!
+    gdrive_scheduled = False
+    if backup_to_gdrive and background_tasks:
+        background_tasks.add_task(cover_service.backup_cover_to_gdrive, local_path, manga_slug)
+        gdrive_scheduled = True
 
     logger.info(f"Admin {current_user.username} uploaded cover for manga: {manga.title}")
 
@@ -670,7 +685,8 @@ async def admin_upload_cover(
         "manga_id": manga.id,
         "cover_path": local_path,
         "cover_url": get_cover_url(local_path),
-        "backed_up_to_gdrive": backup_success
+        "backed_up_to_gdrive": gdrive_scheduled,
+        "gdrive_backup_note": "GDrive backup sedang berjalan di background" if gdrive_scheduled else "GDrive backup disabled"
     }
 
 
@@ -1298,7 +1314,7 @@ async def admin_add_pages(
         Hasilnya: halaman baru → order 6,7. Halaman lama 6-10 → 8-12.
     """
     from app.services.upload_service import UploadService
-    import tempfile, os
+    import tempfile, os, asyncio
 
     chapter = db.query(Chapter).filter(Chapter.id == chapter_id).first()
     if not chapter:
@@ -1379,11 +1395,16 @@ async def admin_add_pages(
                 tmp_path = tmp.name
             temp_paths.append(tmp_path)
 
-            result = rclone._run_command([
-                "copyto", tmp_path,
-                f"{primary_remote}:{gdrive_path_clean}",
-                "--progress"
-            ], timeout=120)
+            # ✅ FIX CONCURRENCY: Offload blocking rclone ke thread pool
+            loop = asyncio.get_event_loop()
+            _tmp = tmp_path
+            _remote_dest = f"{primary_remote}:{gdrive_path_clean}"
+            result = await loop.run_in_executor(
+                None,
+                lambda: rclone._run_command([
+                    "copyto", _tmp, _remote_dest, "--progress"
+                ], timeout=120)
+            )
 
             if result.returncode != 0:
                 for tp in temp_paths:
@@ -1927,7 +1948,7 @@ async def upload_custom_thumbnail(
         if not is_valid:
             raise HTTPException(status_code=400, detail=error_msg)
 
-        import tempfile
+        import tempfile, asyncio
         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
             tmp.write(content)
             tmp_path = tmp.name
@@ -1935,12 +1956,16 @@ async def upload_custom_thumbnail(
         chapter_folder = f"{manga.storage_source.base_folder_id}/{manga.slug}/{chapter.chapter_folder_name}"
         thumbnail_gdrive_path = f"{chapter_folder}/thumbnail.jpg"
 
-        result = thumbnail_service.rclone._run_command([
-            "copyto",
-            tmp_path,
-            f"{thumbnail_service.rclone.remote_name}:{thumbnail_gdrive_path}",
-            "--progress"
-        ], timeout=60)
+        # ✅ FIX CONCURRENCY: Offload blocking rclone ke thread pool
+        loop = asyncio.get_event_loop()
+        _rclone = thumbnail_service.rclone
+        _remote_dest = f"{_rclone.remote_name}:{thumbnail_gdrive_path}"
+        result = await loop.run_in_executor(
+            None,
+            lambda: _rclone._run_command([
+                "copyto", tmp_path, _remote_dest, "--progress"
+            ], timeout=60)
+        )
 
         import os
         os.unlink(tmp_path)
@@ -2807,6 +2832,7 @@ def admin_create_genre(
     current_user: User = Depends(require_role("admin"))
 ):
     """[ADMIN] Tambah genre baru"""
+    slug = normalize_slug(slug)
     if db.query(Genre).filter(Genre.slug == slug).first():
         raise HTTPException(status_code=400, detail=f"Genre slug '{slug}' sudah ada")
 
@@ -2849,6 +2875,7 @@ def admin_create_manga_type(
     current_user: User = Depends(require_role("admin"))
 ):
     """[ADMIN] Tambah tipe manga baru"""
+    slug = normalize_slug(slug)
     if db.query(MangaType).filter(MangaType.slug == slug).first():
         raise HTTPException(status_code=400, detail=f"Type slug '{slug}' sudah ada")
 

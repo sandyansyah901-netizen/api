@@ -18,9 +18,10 @@ REVISI BESAR:
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, status
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict
 import asyncio
 import logging
+import uuid
 
 from app.core.base import get_db, get_current_user, require_role, settings
 from app.models.models import User, Manga, Chapter, Page
@@ -36,6 +37,14 @@ from app.services.thumbnail_service import ThumbnailService
 logger = logging.getLogger(__name__)
 
 upload_router = APIRouter()
+
+# ==========================================
+# ⚡ SMART IMPORT JOB STORE (in-memory)
+# Key: job_id (str), Value: job status dict
+# NOTE: Ini in-memory — jika server restart, history hilang.
+# Cocok untuk single worker. Jika multi-worker, upgrade ke Redis.
+# ==========================================
+_smart_import_jobs: Dict[str, dict] = {}
 
 
 # ==========================================
@@ -566,6 +575,54 @@ async def bulk_upload_multiple_manga(
 
 
 # ==========================================
+# ⚡ HELPER: Background job runner untuk smart import
+# ==========================================
+
+async def _run_smart_import_background(
+    job_id: str,
+    zip_content: bytes,
+    uploader_id: int,
+    storage_id: int,
+    type_slug: str,
+    default_status: str,
+    db_session_factory
+):
+    """
+    Background task yang menjalankan smart import.
+    Update _smart_import_jobs[job_id] sepanjang proses berjalan.
+    """
+    from app.services.smart_bulk_import_service import SmartBulkImportService
+
+    _smart_import_jobs[job_id]["status"] = "running"
+    _smart_import_jobs[job_id]["message"] = "Mengekstrak ZIP dan memproses manga..."
+
+    try:
+        db = db_session_factory()
+        try:
+            smart_import = SmartBulkImportService(db)
+            result = await smart_import.smart_import_from_zip(
+                zip_content=zip_content,
+                uploader_id=uploader_id,
+                storage_id=storage_id,
+                type_slug=type_slug,
+                default_status=default_status,
+                dry_run=False
+            )
+
+            _smart_import_jobs[job_id]["status"] = "completed" if result.get("success") else "failed"
+            _smart_import_jobs[job_id]["message"] = "Import selesai"
+            _smart_import_jobs[job_id]["result"] = result
+        finally:
+            db.close()
+
+    except Exception as e:
+        logger.error(f"Smart import background job {job_id} failed: {str(e)}", exc_info=True)
+        _smart_import_jobs[job_id]["status"] = "failed"
+        _smart_import_jobs[job_id]["message"] = str(e)
+        _smart_import_jobs[job_id]["result"] = {"success": False, "error": str(e)}
+
+
+# ==========================================
 # ✅ SMART BULK IMPORT - AUTO METADATA EXTRACTION
 # ==========================================
 
@@ -576,117 +633,102 @@ async def smart_bulk_import(
     type_slug: str = Form("manga", description="manga | manhwa | manhua | novel"),
     default_status: str = Form("ongoing", description="ongoing | completed"),
     dry_run: bool = Form(False, description="Preview tanpa upload"),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin"))  # Admin only
 ):
     """
     ✅ SMART BULK IMPORT: Auto-import manga dari ZIP dengan metadata extraction + AUTO-THUMBNAILS.
-    
-    **ZIP Structure:**
-    ```
-    upload.zip
-    ├── One Piece/
-    │   ├── cover.jpg (atau .png/.webp)
-    │   ├── description.txt
-    │   ├── genres.txt (comma-separated slugs: action,adventure)
-    │   ├── alt_titles.txt (✨ BARU! format: title|lang per line)
-    │   ├── Chapter_01/
-    │   │   ├── preview.jpg (✨ BARU! custom thumbnail 16:9)
-    │   │   ├── 001.jpg
-    │   │   └── 002.jpg
-    │   └── Chapter_02/
-    │       ├── preview.jpg (✨ BARU!)
-    │       └── ...
-    ├── Naruto/
-    │   ├── cover.png
-    │   ├── description.txt
-    │   ├── genres.txt
-    │   ├── alt_titles.txt (✨ BARU!)
-    │   └── Chapter_01/
-    │       └── ...
-    ```
-    
-    **Features:**
-    - ✅ Auto-generate slug dari nama folder (One Piece → one-piece)
-    - ✅ Extract cover, description, genres dari file
-    - ✅ ✨ Extract alt titles dari alt_titles.txt (BARU!)
-    - ✅ ✨ Support custom preview.jpg per chapter (BARU!)
-    - ✅ Smart merge: hanya update data yang belum ada
-    - ✅ Skip existing chapters
-    - ✅ Upload cover ke local + GDrive backup
-    - ✅ Upload chapters ke GDrive
-    - ✅ Auto-create DB records
-    - ✅ Auto-generate thumbnail 16:9 untuk setiap chapter (dari preview.jpg atau page 1)
-    
-    **Smart Merge Rules:**
-    - Manga exists + no description → add description
-    - Manga exists + no cover → upload cover
-    - Manga exists + no genres → add genres
-    - Manga exists + no alt titles → add alt titles (✨ BARU!)
-    - Chapter exists → skip upload
-    - Chapter new → upload + set preview (✨ BARU!)
-    
-    **Example alt_titles.txt:**
-    ```
-    ワンピース|ja
-    海贼王|zh
-    원피스|ko
-    # Comments are supported
-    ```
-    
-    **Example genres.txt:**
-    ```
-    action,adventure,comedy
-    ```
-    
-    **Example description.txt:**
-    ```
-    Monkey D. Luffy adalah seorang bajak laut yang ingin menjadi Raja Bajak Laut...
-    ```
-    
-    **Preview Behavior:**
-    - If `preview.jpg` exists in chapter folder → use as custom thumbnail
-    - If no preview → auto-generate from page 1
-    - Preview excluded from page images
-    
-    **Slug Generation:**
-    - "One Piece" → "one-piece"
-    - "Naruto Shippuden" → "naruto-shippuden"
-    - "One_Piece" → "one-piece"
+
+    ⚡ ASYNC: Endpoint langsung return job_id. Import berjalan di background.
+    Gunakan GET /smart-import/status/{job_id} untuk polling progress.
+
+    **Dry run** tetap synchronous (ringan, tidak upload).
     """
-    
+
     try:
-        from app.services.smart_bulk_import_service import SmartBulkImportService
-        
-        # Read ZIP content
+        from app.core.base import SessionLocal
+
+        # Baca ZIP content (wajib selesai sebelum return)
         zip_content = await zip_file.read()
-        
+
         logger.info(
             f"Smart import request: ZIP size {len(zip_content)/(1024*1024):.2f}MB, "
             f"storage_id={storage_id}, type={type_slug}, dry_run={dry_run}"
         )
-        
-        # Initialize service
-        smart_import = SmartBulkImportService(db)
-        
-        # Process import
-        result = await smart_import.smart_import_from_zip(
+
+        # DRY RUN: langsung proses (ringan, tidak upload apapun)
+        if dry_run:
+            from app.services.smart_bulk_import_service import SmartBulkImportService
+            smart_import = SmartBulkImportService(db)
+            result = await smart_import.smart_import_from_zip(
+                zip_content=zip_content,
+                uploader_id=current_user.id,
+                storage_id=storage_id,
+                type_slug=type_slug,
+                default_status=default_status,
+                dry_run=True
+            )
+            return result
+
+        # REAL IMPORT: jalankan di background, return job_id langsung
+        job_id = str(uuid.uuid4())
+        _smart_import_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "message": "Import dijadwalkan, akan segera dimulai...",
+            "uploader_id": current_user.id,
+            "storage_id": storage_id,
+            "type_slug": type_slug,
+            "result": None,
+        }
+
+        background_tasks.add_task(
+            _run_smart_import_background,
+            job_id=job_id,
             zip_content=zip_content,
             uploader_id=current_user.id,
             storage_id=storage_id,
             type_slug=type_slug,
             default_status=default_status,
-            dry_run=dry_run
+            db_session_factory=SessionLocal
         )
-        
-        return result
-        
+
+        logger.info(f"⚡ Smart import job {job_id} queued (background). Returning immediately.")
+
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "message": "Import berjalan di background. Gunakan GET /upload/smart-import/status/{job_id} untuk cek progress.",
+            "poll_url": f"/api/v1/upload/smart-import/status/{job_id}"
+        }
+
     except Exception as e:
         logger.error(f"Smart import failed: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Smart import failed: {str(e)}"
         )
+
+
+@upload_router.get("/smart-import/status/{job_id}")
+async def get_smart_import_status(
+    job_id: str,
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    ⚡ Polling endpoint untuk cek status background smart import job.
+
+    Status lifecycle: queued → running → completed | failed
+    """
+    job = _smart_import_jobs.get(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job '{job_id}' tidak ditemukan. Job history hilang jika server restart."
+        )
+    return job
+
 
 
 @upload_router.get("/smart-import/example")
@@ -706,13 +748,15 @@ def get_smart_import_example():
                         "cover.jpg (required: cover image)",
                         "description.txt (optional: manga description)",
                         "genres.txt (optional: comma-separated genre slugs)",
-                        "alt_titles.txt (✨ optional: alternative titles, format: title|lang)"
+                        "alt_titles.txt (optional: alternative titles, format: title|lang)",
+                        "status.txt (✨ optional: manga status, e.g. Ongoing/Completed)",
+                        "type.txt (✨ optional: manga type, e.g. Manga/Manhwa/Manhua)"
                     ],
                     "chapters": [
                         {
                             "folder": "Chapter_01",
                             "files": [
-                                "preview.jpg (✨ optional: custom thumbnail)",
+                                "preview.jpg (optional: custom thumbnail)",
                                 "001.jpg",
                                 "002.jpg",
                                 "003.jpg"
@@ -721,7 +765,7 @@ def get_smart_import_example():
                         {
                             "folder": "Chapter_02",
                             "files": [
-                                "preview.jpg (✨ optional: custom thumbnail)",
+                                "preview.jpg (optional: custom thumbnail)",
                                 "001.jpg",
                                 "002.jpg"
                             ]
@@ -729,12 +773,14 @@ def get_smart_import_example():
                     ]
                 },
                 {
-                    "manga": "Naruto",
+                    "manga": "Tower of God",
                     "files": [
                         "cover.png",
                         "description.txt",
                         "genres.txt",
-                        "alt_titles.txt"
+                        "alt_titles.txt",
+                        "status.txt (✨ isi: Ongoing)",
+                        "type.txt (✨ isi: Manhwa)"
                     ],
                     "chapters": [
                         {
@@ -746,8 +792,24 @@ def get_smart_import_example():
             ]
         },
         "file_formats": {
+            "status_txt": {
+                "description": "✨ Manga publication status",
+                "format": "Single line, case-insensitive",
+                "valid_values": ["Ongoing", "Completed", "Hiatus", "Cancelled"],
+                "example": "Ongoing",
+                "priority": "status.txt > default_status parameter",
+                "note": "✨ NEW! Override default_status per manga"
+            },
+            "type_txt": {
+                "description": "✨ Manga type/format",
+                "format": "Single line, case-insensitive",
+                "valid_values": ["Manga", "Manhwa", "Manhua", "Novel", "Doujinshi", "One-Shot"],
+                "example": "Manhwa",
+                "priority": "type.txt > file marker (manhwa.txt) > type_slug parameter",
+                "note": "✨ NEW! Highest priority for type detection"
+            },
             "alt_titles_txt": {
-                "description": "✨ Alternative titles in different languages",
+                "description": "Alternative titles in different languages",
                 "format": "title|lang (one per line)",
                 "example": "ワンピース|ja\n海贼王|zh\n원피스|ko\n# This is a comment",
                 "rules": [
@@ -757,7 +819,7 @@ def get_smart_import_example():
                     "Lines starting with # are comments",
                     "Empty lines are skipped"
                 ],
-                "note": "✨ NEW FEATURE! Auto-merged with existing alt titles"
+                "note": "Auto-merged with existing alt titles"
             },
             "genres_txt": {
                 "description": "Comma-separated genre slugs",
@@ -766,7 +828,7 @@ def get_smart_import_example():
             },
             "description_txt": {
                 "description": "Plain text description",
-                "example": "Monkey D. Luffy adalah seorang bajak laut yang ingin menjadi Raja Bajak Laut dengan mencari harta karun legendaris One Piece.\n\nBersama kru Topi Jerami, mereka menjelajahi Grand Line untuk mencapai impian mereka.",
+                "example": "Monkey D. Luffy adalah seorang bajak laut yang ingin menjadi Raja Bajak Laut.",
                 "note": "Support multi-line, encoding UTF-8"
             },
             "cover_image": {
@@ -776,7 +838,7 @@ def get_smart_import_example():
                 "note": "Will be optimized automatically (resize + compress)"
             },
             "preview_image": {
-                "description": "✨ Custom chapter thumbnail/preview",
+                "description": "Custom chapter thumbnail/preview",
                 "formats": ["preview.jpg", "preview.jpeg", "preview.png", "preview.webp"],
                 "location": "Inside chapter folder",
                 "behavior": [
@@ -785,8 +847,19 @@ def get_smart_import_example():
                     "Excluded from page images",
                     "Recommended aspect ratio: 16:9"
                 ],
-                "note": "✨ NEW FEATURE! Custom preview per chapter"
+                "note": "Custom preview per chapter"
             }
+        },
+        "type_detection_priority": {
+            "description": "✨ Type resolution order (highest to lowest)",
+            "priority_1": "type.txt (isi file, e.g. 'Manhwa') — ✨ NEW",
+            "priority_2": "File marker (manhwa.txt, manga.txt, dll) — dari nama file",
+            "priority_3": "Parameter API type_slug — fallback terakhir"
+        },
+        "status_detection_priority": {
+            "description": "✨ Status resolution order (highest to lowest)",
+            "priority_1": "status.txt (isi file, e.g. 'Ongoing') — ✨ NEW",
+            "priority_2": "Parameter API default_status — fallback terakhir"
         },
         "slug_generation_examples": {
             "One Piece": "one-piece",
@@ -807,7 +880,9 @@ def get_smart_import_example():
                 "cover_exists": "Skip (tidak overwrite)",
                 "genres_empty": "Add genres from genres.txt",
                 "genres_exists": "Skip (tidak overwrite)",
-                "alt_titles": "✨ Add new alt titles (skip duplicates)"
+                "alt_titles": "Add new alt titles (skip duplicates)",
+                "status": "✨ Use status.txt if available, else keep existing",
+                "type": "✨ Use type.txt if available, else keep existing"
             },
             "chapter_new": {
                 "action": "Upload to GDrive + create DB record + set preview",
@@ -827,7 +902,9 @@ def get_smart_import_example():
                     "Detected manga & chapters",
                     "Alt titles preview",
                     "Custom previews detected",
-                    "Conflicts with existing data"
+                    "Conflicts with existing data",
+                    "✨ Detected type (with source: type.txt / marker / api_default)",
+                    "✨ Detected status (from status.txt or default)"
                 ]
             },
             "actual_import": {
@@ -847,20 +924,37 @@ def get_smart_import_example():
             "Nama folder manga akan otomatis jadi slug (spasi → dash, lowercase)",
             "Chapter folder name akan auto-detect nomor chapter (Chapter_01, Ch 1, etc)",
             "Cover akan di-optimize otomatis (resize + compress)",
-            "✨ Alt titles format: title|lang (contoh: ワンピース|ja)",
-            "✨ Custom preview: tambah preview.jpg di folder chapter untuk thumbnail kustom",
-            "✨ Preview auto-exclude dari page images",
-            "Smart merge memastikan data existing tidak di-overwrite"
+            "Alt titles format: title|lang (contoh: ワンピース|ja)",
+            "Custom preview: tambah preview.jpg di folder chapter untuk thumbnail kustom",
+            "Preview auto-exclude dari page images",
+            "Smart merge memastikan data existing tidak di-overwrite",
+            "✨ BARU: Tambah status.txt untuk set status per manga (Ongoing/Completed/Hiatus/Cancelled)",
+            "✨ BARU: Tambah type.txt untuk set type per manga (Manga/Manhwa/Manhua/Novel)",
+            "✨ type.txt prioritas lebih tinggi dari file marker (manhwa.txt dll)"
         ],
         "new_features": {
-            "alt_titles_support": {
+            "status_file_support": {
                 "status": "✨ NEW",
+                "description": "Read manga status from status.txt file content",
+                "valid_values": ["ongoing", "completed", "hiatus", "cancelled"],
+                "example_file": "Ongoing",
+                "priority": "status.txt > default_status API parameter"
+            },
+            "type_file_support": {
+                "status": "✨ NEW",
+                "description": "Read manga type from type.txt file content (highest priority)",
+                "valid_values": ["manga", "manhwa", "manhua", "novel", "doujinshi", "one-shot"],
+                "example_file": "Manhwa",
+                "priority": "type.txt > file marker > type_slug API parameter"
+            },
+            "alt_titles_support": {
+                "status": "EXISTING",
                 "description": "Auto-import alternative titles from alt_titles.txt",
                 "format": "title|lang",
                 "example_file": "ワンピース|ja\n海贼王|zh\n원피스|ko"
             },
             "custom_preview_support": {
-                "status": "✨ NEW",
+                "status": "EXISTING",
                 "description": "Custom thumbnail/preview per chapter",
                 "filename": "preview.jpg/png/webp",
                 "location": "Inside chapter folder",
@@ -983,10 +1077,12 @@ def upload_service_health():
                 "smart_bulk_import": True,
                 "smart_import_alt_titles": True,
                 "smart_import_custom_preview": True,
+                "smart_import_status_file": True,
+                "smart_import_type_file": True,
                 "progress_tracking": True,
                 "resume_upload": True,
                 "auto_thumbnail_generation": True,
-                "group_aware_upload": True,  # ✅ GROUP-AWARE
+                "group_aware_upload": True,
             }
         }
         

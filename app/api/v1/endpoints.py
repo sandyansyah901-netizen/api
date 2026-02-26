@@ -32,6 +32,7 @@ from app.core.base import (
     get_db, get_current_user, require_role,
     verify_password, get_password_hash, create_access_token, settings
 )
+from app.utils.slug_utils import normalize_slug
 from app.models.models import (
     User, Role, Manga, MangaType, Genre, Chapter, Page
 )
@@ -461,6 +462,7 @@ def get_manga_detail(manga_slug: str, db: Session = Depends(get_db)):
     - ✅ Cover image URL
     - ✅ Description
     """
+    manga_slug = normalize_slug(manga_slug)
     manga = db.query(Manga).filter(Manga.slug == manga_slug).first()
     
     if not manga:
@@ -524,6 +526,7 @@ def get_manga_cover(manga_slug: str, db: Session = Depends(get_db)):
         cover_url: "/static/covers/one-piece.jpg"
     """
     # 1. Cari manga berdasarkan slug
+    manga_slug = normalize_slug(manga_slug)
     manga = db.query(Manga).filter(Manga.slug == manga_slug).first()
     
     if not manga:
@@ -605,6 +608,7 @@ def list_chapters_by_manga(
     Bisa diubah ke descending untuk latest first.
     """
     # Find manga
+    manga_slug = normalize_slug(manga_slug)
     manga = db.query(Manga).filter(Manga.slug == manga_slug).first()
     
     if not manga:
@@ -668,6 +672,7 @@ def get_chapter_detail(chapter_slug: str, db: Session = Depends(get_db)):
     - Manga info
     - List of pages dengan proxy URLs
     """
+    chapter_slug = normalize_slug(chapter_slug)
     chapter = db.query(Chapter).filter(Chapter.slug == chapter_slug).first()
     
     if not chapter:

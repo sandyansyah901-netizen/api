@@ -72,9 +72,8 @@ class UploadService:
         self._ensure_upload_dir()
 
         # ✅ PRIMARY remote untuk upload (group 1 default)
-        self.primary_rclone = RcloneService()
         self.primary_remote_name = settings.get_primary_remote()
-        self.primary_rclone.remote_name = self.primary_remote_name
+        self.primary_rclone = RcloneService(remote_name=self.primary_remote_name)
 
         # ✅ SECONDARY remotes untuk mirror (group 1)
         self.secondary_remotes: Dict[str, RcloneService] = {}
@@ -82,8 +81,7 @@ class UploadService:
         if settings.is_multi_remote_enabled:
             for remote_name in settings.get_secondary_remotes():
                 try:
-                    rclone = RcloneService()
-                    rclone.remote_name = remote_name
+                    rclone = RcloneService(remote_name=remote_name)
 
                     if rclone.test_connection():
                         self.secondary_remotes[remote_name] = rclone

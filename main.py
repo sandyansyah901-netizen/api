@@ -552,11 +552,98 @@ async def add_process_time_header(request: Request, call_next):
 
 # ==========================================
 # ✅ FIX #2 + #3 + #10: View Tracking Middleware (REWRITTEN)
+# ✅ FIX CONCURRENCY: DB calls offloaded to thread pool via run_in_executor
 # ==========================================
+
+def _do_track_manga_view(manga_slug: str, auth_header: str, client_ip: str):
+    """Sync helper: track manga view in DB. Runs in thread pool."""
+    db = None
+    try:
+        db = SessionLocal()
+        manga = db.query(Manga).filter(Manga.slug == manga_slug).first()
+        if manga:
+            user_id = None
+            if auth_header and auth_header.startswith("Bearer "):
+                try:
+                    token = auth_header.split(" ")[1]
+                    payload = decode_access_token(token)
+                    if payload:
+                        username = payload.get("sub")
+                        if username:
+                            user = db.query(User).filter(User.username == username).first()
+                            if user:
+                                user_id = user.id
+                except Exception:
+                    pass
+
+            hashed_ip = hash_ip_address(client_ip)
+            view = MangaView(
+                manga_id=manga.id,
+                user_id=user_id,
+                ip_address=hashed_ip
+            )
+            db.add(view)
+            db.commit()
+    except Exception as e:
+        logger.error(f"Failed to track manga view: {str(e)}")
+        if db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    finally:
+        if db:
+            db.close()
+
+
+def _do_track_chapter_view(chapter_slug: str, auth_header: str, client_ip: str):
+    """Sync helper: track chapter view in DB. Runs in thread pool."""
+    db = None
+    try:
+        db = SessionLocal()
+        chapter = db.query(Chapter).filter(Chapter.slug == chapter_slug).first()
+        if chapter:
+            user_id = None
+            if auth_header and auth_header.startswith("Bearer "):
+                try:
+                    token = auth_header.split(" ")[1]
+                    payload = decode_access_token(token)
+                    if payload:
+                        username = payload.get("sub")
+                        if username:
+                            user = db.query(User).filter(User.username == username).first()
+                            if user:
+                                user_id = user.id
+                except Exception:
+                    pass
+
+            hashed_ip = hash_ip_address(client_ip)
+            view = ChapterView(
+                chapter_id=chapter.id,
+                user_id=user_id,
+                ip_address=hashed_ip
+            )
+            db.add(view)
+            db.commit()
+    except Exception as e:
+        logger.error(f"Failed to track chapter view: {str(e)}")
+        if db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    finally:
+        if db:
+            db.close()
+
 
 @app.middleware("http")
 async def track_views_middleware(request: Request, call_next):
-    """Track manga and chapter views for analytics."""
+    """Track manga and chapter views for analytics.
+    
+    ✅ FIX CONCURRENCY: DB work runs in thread pool via run_in_executor
+    so it never blocks the async event loop.
+    """
     response = await call_next(request)
 
     # Only track successful GET requests
@@ -564,10 +651,13 @@ async def track_views_middleware(request: Request, call_next):
         return response
 
     path = request.url.path.rstrip("/")
-
-    # Track MANGA views
     parts = path.split("/")
 
+    # Extract request info (non-blocking)
+    auth_header = request.headers.get("authorization", "")
+    client_ip = request.client.host if request.client else None
+
+    # Track MANGA views — offload to thread pool
     if (
         len(parts) == 5
         and parts[1] == "api"
@@ -575,38 +665,10 @@ async def track_views_middleware(request: Request, call_next):
         and parts[3] == "manga"
         and parts[4] not in ("types", "genres", "")
     ):
-        db = None
-        try:
-            manga_slug = parts[4]
-            db = SessionLocal()
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _do_track_manga_view, parts[4], auth_header, client_ip)
 
-            manga = db.query(Manga).filter(Manga.slug == manga_slug).first()
-            if manga:
-                user_id = extract_user_id_from_request(request, db)
-
-                raw_ip = request.client.host if request.client else None
-                hashed_ip = hash_ip_address(raw_ip)
-
-                view = MangaView(
-                    manga_id=manga.id,
-                    user_id=user_id,
-                    ip_address=hashed_ip
-                )
-                db.add(view)
-                db.commit()
-
-        except Exception as e:
-            logger.error(f"Failed to track manga view: {str(e)}")
-            if db:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-        finally:
-            if db:
-                db.close()
-
-    # Track CHAPTER views
+    # Track CHAPTER views — offload to thread pool
     elif (
         len(parts) == 5
         and parts[1] == "api"
@@ -614,36 +676,8 @@ async def track_views_middleware(request: Request, call_next):
         and parts[3] == "chapter"
         and parts[4] not in ("manga", "")
     ):
-        db = None
-        try:
-            chapter_slug = parts[4]
-            db = SessionLocal()
-
-            chapter = db.query(Chapter).filter(Chapter.slug == chapter_slug).first()
-            if chapter:
-                user_id = extract_user_id_from_request(request, db)
-
-                raw_ip = request.client.host if request.client else None
-                hashed_ip = hash_ip_address(raw_ip)
-
-                view = ChapterView(
-                    chapter_id=chapter.id,
-                    user_id=user_id,
-                    ip_address=hashed_ip
-                )
-                db.add(view)
-                db.commit()
-
-        except Exception as e:
-            logger.error(f"Failed to track chapter view: {str(e)}")
-            if db:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-        finally:
-            if db:
-                db.close()
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _do_track_chapter_view, parts[4], auth_header, client_ip)
 
     return response
 

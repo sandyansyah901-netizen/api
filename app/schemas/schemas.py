@@ -8,6 +8,7 @@ REVISI: cover_image_url → cover_image_path
 """
 
 from pydantic import BaseModel, EmailStr, Field, validator
+from app.utils.slug_utils import normalize_slug
 from typing import List, Optional
 from datetime import datetime
 
@@ -134,6 +135,10 @@ class MangaCreate(BaseModel):
     genre_slugs: Optional[List[str]] = []
     alt_titles: Optional[List[dict]] = []
 
+    @validator('slug')
+    def normalize_slug_field(cls, v):
+        return normalize_slug(v) if v else v
+
 
 class MangaListResponse(BaseModel):
     id: int
@@ -204,6 +209,10 @@ class ChapterCreate(BaseModel):
     anchor_path: Optional[str] = None
     preview_url: Optional[str] = None
 
+    @validator('slug')
+    def normalize_slug_field(cls, v):
+        return normalize_slug(v) if v else v
+
 
 class ChapterResponse(BaseModel):
     id: int
@@ -259,6 +268,10 @@ class MangaUpdateRequest(BaseModel):
     storage_id: Optional[int] = None
     genre_slugs: Optional[List[str]] = None
 
+    @validator('slug')
+    def normalize_slug_field(cls, v):
+        return normalize_slug(v) if v else v
+
 
 class AdminMangaResponse(BaseModel):
     id: int
@@ -284,6 +297,10 @@ class ChapterUpdateRequest(BaseModel):
     chapter_type: Optional[str] = None
     anchor_path: Optional[str] = None
     preview_url: Optional[str] = None
+
+    @validator('slug')
+    def normalize_slug_field(cls, v):
+        return normalize_slug(v) if v else v
 
 
 class AdminChapterResponse(BaseModel):

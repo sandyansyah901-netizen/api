@@ -4,7 +4,7 @@ upload.zip
 │   ├── description.txt        ← Deskripsi
 │   ├── genres.txt             ← action,adventure,shounen
 │   ├── alt_titles.txt         ← ワンピース|ja
-│   │                             海贼王|zh
+│   │                             海贼王|ch
 │   ├── Chapter_01/
 │   │   ├── preview.jpg        ← Custom preview (16:9 recommended)
 │   │   ├── 001.jpg

@@ -107,8 +107,7 @@ class BackgroundSyncTask:
         
         for remote_name in target_remotes:
             try:
-                rclone = RcloneService()
-                rclone.remote_name = remote_name
+                rclone = RcloneService(remote_name=remote_name)
                 
                 # Upload file
                 full_remote_path = f"{remote_name}:{remote_path}"

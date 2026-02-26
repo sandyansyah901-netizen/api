@@ -338,9 +338,12 @@ class Settings(BaseSettings):
         cache_path = Path(v)
         try:
             cache_path.mkdir(parents=True, exist_ok=True)
-            test_file = cache_path / '.write_test'
+            # ✅ FIX: Use unique filename per process to avoid race condition
+            # when multiple uvicorn workers spawn simultaneously
+            import os
+            test_file = cache_path / f'.write_test_{os.getpid()}'
             test_file.touch()
-            test_file.unlink()
+            test_file.unlink(missing_ok=True)
         except Exception as e:
             raise ValueError(f"RCLONE_CACHE_DIR '{v}' is not writable: {str(e)}")
         return str(cache_path.absolute())
@@ -351,9 +354,12 @@ class Settings(BaseSettings):
         covers_path = Path(v)
         try:
             covers_path.mkdir(parents=True, exist_ok=True)
-            test_file = covers_path / '.write_test'
+            # ✅ FIX: Use unique filename per process to avoid race condition
+            # when multiple uvicorn workers spawn simultaneously
+            import os
+            test_file = covers_path / f'.write_test_{os.getpid()}'
             test_file.touch()
-            test_file.unlink()
+            test_file.unlink(missing_ok=True)
         except Exception as e:
             raise ValueError(f"COVERS_DIR '{v}' is not writable: {str(e)}")
         return str(covers_path.absolute())

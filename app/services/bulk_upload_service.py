@@ -190,6 +190,8 @@ def auto_detect_chapter_info(
 
 def generate_chapter_slug(manga_slug: str, chapter_main: int, chapter_sub: int = 0) -> str:
     """Generate unique slug untuk chapter."""
+    from app.utils.slug_utils import normalize_slug
+    manga_slug = normalize_slug(manga_slug)
     if chapter_sub > 0:
         return f"{manga_slug}-chapter-{chapter_main}-{chapter_sub}"
     return f"{manga_slug}-chapter-{chapter_main}"

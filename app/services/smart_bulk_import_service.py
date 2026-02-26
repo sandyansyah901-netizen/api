@@ -4,12 +4,14 @@ Smart Bulk Import Service - ENHANCED VERSION
 =============================================
 Auto-import manga dari ZIP dengan metadata extraction.
 
-FITUR BARU:
+FITUR:
 ✅ Auto-detect folder struktur
 ✅ Extract cover, description, genres dari file
-✅ ✨ Extract alt titles dari alt_titles.txt (BARU!)
-✅ ✨ Support custom preview.jpg per chapter (BARU!)
-✅ ✨ Auto-detect manga type dari file marker (manga.txt/manhwa.txt/dll) (BARU!)
+✅ Extract alt titles dari alt_titles.txt
+✅ Support custom preview.jpg per chapter
+✅ Auto-detect manga type dari file marker (manga.txt/manhwa.txt/dll)
+✅ ✨ Read type dari type.txt (BARU! prioritas di atas file marker)
+✅ ✨ Read status dari status.txt (BARU! override default_status)
 ✅ Skip existing data (smart merge)
 ✅ Auto-generate slug dari nama folder
 ✅ Batch upload ke GDrive + DB
@@ -20,21 +22,19 @@ FITUR BARU:
 
 REVISI COVER:
 ✅ save_cover_local() sekarang preserve format asli (jpg/png/webp)
-   dengan pass source_filename=cover_path.name
-✅ backup_cover_to_gdrive() sekarang pakai nama file asli (bukan hardcode .jpg)
-   karena CoverService sudah menggunakan nama file dengan ekstensi yang benar
+✅ backup_cover_to_gdrive() sekarang pakai nama file asli
 
-REVISI TYPE DETECTION:
-✅ _read_manga_type() — deteksi type dari file marker di dalam folder manga:
-   - manga.txt     → type_slug = "manga"
-   - manhwa.txt    → type_slug = "manhwa"
-   - manhua.txt    → type_slug = "manhua"
-   - novel.txt     → type_slug = "novel"
-   - doujinshi.txt → type_slug = "doujinshi"
-   - one-shot.txt  → type_slug = "one-shot"
-   Kalau tidak ada file marker → pakai default type_slug dari parameter API
+REVISI TYPE DETECTION (PRIORITAS):
+  1. type.txt    → baca ISI file ("Manhwa" → "manhwa") ✨ BARU
+  2. manga.txt / manhwa.txt / dll → deteksi dari NAMA file marker
+  3. Parameter API type_slug → fallback terakhir
+
+REVISI STATUS DETECTION (PRIORITAS):
+  1. status.txt  → baca ISI file ("Ongoing" → "ongoing") ✨ BARU
+  2. Parameter API default_status → fallback terakhir
 """
 
+import asyncio
 import logging
 import shutil
 import re
@@ -87,22 +87,8 @@ class SmartBulkImportService:
         - "One_Piece" → "one-piece"
         - "Naruto Shippuden" → "naruto-shippuden"
         """
-        # Replace underscore dan space dengan dash
-        slug = title.replace("_", "-").replace(" ", "-")
-
-        # Lowercase
-        slug = slug.lower()
-
-        # Remove special characters (keep alphanumeric dan dash)
-        slug = re.sub(r'[^a-z0-9\-]', '', slug)
-
-        # Remove multiple dashes
-        slug = re.sub(r'-+', '-', slug)
-
-        # Remove leading/trailing dashes
-        slug = slug.strip('-')
-
-        return slug
+        from app.utils.slug_utils import normalize_slug
+        return normalize_slug(title)
 
     def detect_manga_folders(self, extract_dir: Path) -> List[Dict]:
         """
@@ -145,11 +131,20 @@ class SmartBulkImportService:
             # Read genres
             genres = self._read_genres(folder)
 
-            # ✨ Read alt titles (BARU!)
+            # Read alt titles
             alt_titles = self._read_alt_titles(folder)
 
-            # ✨ BARU: Detect manga type dari file marker
-            detected_type_slug = self._read_manga_type(folder)
+            # ✨ Read type dari type.txt (prioritas 1)
+            type_from_file = self._read_type_from_file(folder)
+
+            # Detect manga type dari file marker (prioritas 2)
+            type_from_marker = self._read_manga_type(folder)
+
+            # Resolve: type.txt > file marker > API default
+            detected_type_slug = type_from_file or type_from_marker
+
+            # ✨ Read status dari status.txt
+            detected_status = self._read_status(folder)
 
             # Detect chapters
             chapters = self._detect_chapters(folder)
@@ -164,8 +159,10 @@ class SmartBulkImportService:
                 "cover_path": cover_path,
                 "description": description,
                 "genres": genres,
-                "alt_titles": alt_titles,          # ✨ BARU
-                "detected_type_slug": detected_type_slug,  # ✨ BARU: None jika tidak ada marker
+                "alt_titles": alt_titles,
+                "detected_type_slug": detected_type_slug,
+                "type_source": "type.txt" if type_from_file else ("marker" if type_from_marker else None),
+                "detected_status": detected_status,
                 "chapters": chapters,
                 "folder_path": folder
             }
@@ -365,6 +362,124 @@ class SmartBulkImportService:
 
         return None  # Tidak ada marker → pakai default dari parameter API
 
+    # ==========================================
+    # ✨ BARU: _read_type_from_file
+    # Baca type dari ISI file type.txt
+    #
+    # Cara pakai di ZIP:
+    #   One Piece/
+    #     type.txt        ← isi: "Manga" atau "manga"
+    #     cover.jpg
+    #     ...
+    #
+    # Prioritas:
+    #   1. type.txt (isi file)
+    #   2. manga.txt/manhwa.txt/dll (nama file marker)
+    #   3. Parameter API type_slug (fallback)
+    # ==========================================
+
+    # Valid type slugs yang diterima
+    VALID_TYPE_SLUGS = {"manga", "manhwa", "manhua", "novel", "doujinshi", "one-shot"}
+
+    def _read_type_from_file(self, folder: Path) -> Optional[str]:
+        """
+        ✨ BARU: Read manga type dari isi file type.txt.
+
+        Isi file di-normalize ke lowercase slug.
+        Contoh: "Manhwa" → "manhwa", "Manga" → "manga"
+
+        Args:
+            folder: Manga folder path
+
+        Returns:
+            type_slug string atau None jika file tidak ada / invalid
+        """
+        type_file = folder / "type.txt"
+
+        if not type_file.exists():
+            return None
+
+        try:
+            with open(type_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip().lower()
+
+            if not content:
+                logger.warning(f"type.txt is empty in '{folder.name}'")
+                return None
+
+            # Normalize: hapus whitespace ekstra
+            type_slug = re.sub(r'\s+', '-', content)
+
+            if type_slug in self.VALID_TYPE_SLUGS:
+                logger.info(f"✅ Detected type from type.txt: '{type_slug}' (folder: {folder.name})")
+                return type_slug
+            else:
+                logger.warning(
+                    f"⚠️ Invalid type '{content}' in type.txt (folder: {folder.name}). "
+                    f"Valid types: {', '.join(sorted(self.VALID_TYPE_SLUGS))}"
+                )
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to read type.txt: {str(e)}")
+            return None
+
+    # ==========================================
+    # ✨ BARU: _read_status
+    # Baca status dari ISI file status.txt
+    #
+    # Cara pakai di ZIP:
+    #   One Piece/
+    #     status.txt      ← isi: "Ongoing" atau "ongoing"
+    #     cover.jpg
+    #     ...
+    #
+    # Valid values:
+    #   ongoing, completed, hiatus, cancelled
+    # ==========================================
+
+    VALID_STATUSES = {"ongoing", "completed", "hiatus", "cancelled"}
+
+    def _read_status(self, folder: Path) -> Optional[str]:
+        """
+        ✨ BARU: Read manga status dari isi file status.txt.
+
+        Isi file di-normalize ke lowercase.
+        Contoh: "Ongoing" → "ongoing", "Completed" → "completed"
+
+        Args:
+            folder: Manga folder path
+
+        Returns:
+            status string atau None jika file tidak ada / invalid
+        """
+        status_file = folder / "status.txt"
+
+        if not status_file.exists():
+            return None
+
+        try:
+            with open(status_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip().lower()
+
+            if not content:
+                logger.warning(f"status.txt is empty in '{folder.name}'")
+                return None
+
+            if content in self.VALID_STATUSES:
+                logger.info(f"✅ Detected status from status.txt: '{content}' (folder: {folder.name})")
+                return content
+            else:
+                logger.warning(
+                    f"⚠️ Invalid status '{content}' in status.txt (folder: {folder.name}). "
+                    f"Valid statuses: {', '.join(sorted(self.VALID_STATUSES))}"
+                )
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to read status.txt: {str(e)}")
+            return None
+
     def _find_preview_in_chapter(self, chapter_folder: Path) -> Optional[Path]:
         """
         ✨ BARU: Find preview.jpg in chapter folder.
@@ -537,31 +652,33 @@ class SmartBulkImportService:
                         Manga.slug == manga_info['slug']
                     ).first()
 
-                    # ✅ REVISI: tampilkan cover format di dry run
                     cover_format = None
                     if manga_info['cover_path']:
                         cover_format = manga_info['cover_path'].suffix.lower()
 
-                    # ✨ BARU: resolved type untuk dry run
+                    # Resolved type & status untuk dry run
                     resolved_type = manga_info['detected_type_slug'] or type_slug
+                    resolved_status = manga_info['detected_status'] or default_status
 
                     preview.append({
                         "title": manga_info['title'],
                         "slug": manga_info['slug'],
                         "exists": existing is not None,
                         "has_cover": manga_info['cover_path'] is not None,
-                        "cover_format": cover_format,       # ✅ REVISI: tambah info format cover
+                        "cover_format": cover_format,
                         "has_description": manga_info['description'] is not None,
                         "genres": manga_info['genres'],
-                        "alt_titles": manga_info['alt_titles'],  # ✨ BARU
-                        "detected_type": resolved_type,         # ✨ BARU: type yang akan dipakai
-                        "type_from_marker": manga_info['detected_type_slug'] is not None,  # ✨ BARU
+                        "alt_titles": manga_info['alt_titles'],
+                        "detected_type": resolved_type,
+                        "type_source": manga_info.get('type_source') or "api_default",
+                        "detected_status": resolved_status,
+                        "status_from_file": manga_info['detected_status'] is not None,
                         "total_chapters": len(manga_info['chapters']),
                         "chapters": [
                             {
                                 "chapter_label": ch['chapter_label'],
                                 "file_count": ch['file_count'],
-                                "has_preview": ch.get('has_preview', False)  # ✨ BARU
+                                "has_preview": ch.get('has_preview', False)
                             }
                             for ch in manga_info['chapters']
                         ]
@@ -577,12 +694,9 @@ class SmartBulkImportService:
 
             # 4. Process setiap manga
             for manga_info in manga_folders:
-                # ✨ BARU: Resolve type per manga
-                # Jika ada file marker di folder → pakai itu
-                # Jika tidak → pakai default type_slug dari parameter API
+                # Resolve type per manga: type.txt > file marker > API default
                 resolved_type_slug = manga_info['detected_type_slug'] or type_slug
 
-                # ✨ BARU: Ambil MangaType dari DB sesuai resolved_type_slug
                 resolved_manga_type = self.db.query(MangaType).filter(
                     MangaType.slug == resolved_type_slug
                 ).first()
@@ -594,12 +708,15 @@ class SmartBulkImportService:
                     )
                     resolved_manga_type = default_manga_type
 
+                # ✨ Resolve status per manga: status.txt > API default
+                resolved_status = manga_info['detected_status'] or default_status
+
                 result = await self._process_single_manga(
                     manga_info,
                     storage_id,
                     resolved_manga_type.id,
                     base_folder_id,
-                    default_status,
+                    resolved_status,
                     uploader_id
                 )
                 results.append(result)
@@ -724,23 +841,27 @@ class SmartBulkImportService:
                 with open(cover_path, 'rb') as f:
                     cover_content = f.read()
 
-                # ✅ REVISI: Gunakan source_filename agar save_cover_local() preserve format
-                # cover.webp → disimpan sebagai {slug}.webp (bukan hardcode .jpg)
-                # cover.png  → disimpan sebagai {slug}.png
-                # cover.jpg  → disimpan sebagai {slug}.jpg
-                local_cover_path = self.cover_service.save_cover_local(
-                    cover_content,
-                    slug,
-                    optimize=True,
-                    source_filename=cover_path.name  # ✅ REVISI: pass nama file asli
+                # ⚡ FIX: run_in_executor agar event loop tidak blocked
+                loop = asyncio.get_event_loop()
+                local_cover_path = await loop.run_in_executor(
+                    None,
+                    lambda: self.cover_service.save_cover_local(
+                        cover_content,
+                        slug,
+                        optimize=True,
+                        source_filename=cover_path.name
+                    )
                 )
 
                 if local_cover_path:
                     manga.cover_image_path = local_cover_path
 
-                    # ✅ REVISI: backup_cover_to_gdrive pakai local_cover_path
-                    # (yang sudah include ekstensi yang benar, bukan hardcode .jpg)
-                    self.cover_service.backup_cover_to_gdrive(local_cover_path, slug)
+                    # ⚡ FIX: backup_cover_to_gdrive juga dioffload ke threadpool
+                    _lcp = local_cover_path
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.cover_service.backup_cover_to_gdrive(_lcp, slug)
+                    )
                     logger.info(
                         f"  ✅ Uploaded cover ({cover_path.suffix.upper()} format preserved): "
                         f"{local_cover_path}"
@@ -907,15 +1028,19 @@ class SmartBulkImportService:
 
             # --------------------------------------------------
             # STEP 2: Buat folder di GDrive (mkdir)
+            # ⚡ FIX: run_in_executor agar event loop tidak blocked
             # --------------------------------------------------
-            rclone._run_command([
-                "mkdir",
-                f"{rclone.remote_name}:{manga_folder}"
-            ])
-            rclone._run_command([
-                "mkdir",
-                f"{rclone.remote_name}:{chapter_folder}"
-            ])
+            loop = asyncio.get_event_loop()
+            _remote_manga = f"{rclone.remote_name}:{manga_folder}"
+            _remote_chapter = f"{rclone.remote_name}:{chapter_folder}"
+            await loop.run_in_executor(
+                None,
+                lambda: rclone._run_command(["mkdir", _remote_manga])
+            )
+            await loop.run_in_executor(
+                None,
+                lambda: rclone._run_command(["mkdir", _remote_chapter])
+            )
 
             # --------------------------------------------------
             # STEP 3: ⚡ Upload SATU FOLDER sekaligus (jauh lebih cepat!)
@@ -932,18 +1057,24 @@ class SmartBulkImportService:
                 f"(transfers=8, checkers=8, chunk=64M)..."
             )
 
-            upload_result = rclone._run_command(
-                [
-                    "copy",
-                    str(temp_stage_dir),
-                    f"{rclone.remote_name}:{chapter_folder}",
-                    "--transfers", "8",
-                    "--checkers", "8",
-                    "--drive-chunk-size", "64M",
-                    "--fast-list",
-                    "--no-traverse",
-                ],
-                timeout=300  # 5 menit timeout untuk folder besar
+            # ⚡ FIX: rclone copy (operasi paling lama) dioffload ke threadpool
+            _stage_dir_str = str(temp_stage_dir)
+            _chapter_remote = f"{rclone.remote_name}:{chapter_folder}"
+            upload_result = await loop.run_in_executor(
+                None,
+                lambda: rclone._run_command(
+                    [
+                        "copy",
+                        _stage_dir_str,
+                        _chapter_remote,
+                        "--transfers", "8",
+                        "--checkers", "8",
+                        "--drive-chunk-size", "64M",
+                        "--fast-list",
+                        "--no-traverse",
+                    ],
+                    timeout=300  # 5 menit timeout untuk folder besar
+                )
             )
 
             if upload_result.returncode != 0:
@@ -976,16 +1107,22 @@ class SmartBulkImportService:
                 )
                 for backup_remote in backup_remotes:
                     try:
-                        mirror_result = rclone._run_command(
-                            [
-                                "copy",
-                                f"{rclone.remote_name}:{chapter_folder}",
-                                f"{backup_remote}:{chapter_folder}",
-                                "--transfers", "8",
-                                "--checkers", "8",
-                                "--fast-list",
-                            ],
-                            timeout=300
+                        # ⚡ FIX: mirror juga dioffload ke threadpool
+                        _src = f"{rclone.remote_name}:{chapter_folder}"
+                        _dst = f"{backup_remote}:{chapter_folder}"
+                        mirror_result = await loop.run_in_executor(
+                            None,
+                            lambda: rclone._run_command(
+                                [
+                                    "copy",
+                                    _src,
+                                    _dst,
+                                    "--transfers", "8",
+                                    "--checkers", "8",
+                                    "--fast-list",
+                                ],
+                                timeout=300
+                            )
                         )
                         if mirror_result.returncode == 0:
                             logger.info(f"  ✅ Mirrored to '{backup_remote}'")
@@ -1015,11 +1152,16 @@ class SmartBulkImportService:
 
                     logger.info(f"📤 Uploading custom preview: {preview_path.name}")
 
-                    result = rclone._run_command([
-                        "copyto",
-                        str(preview_path),
-                        preview_remote_path
-                    ], timeout=60)
+                    # ⚡ FIX: preview upload juga dioffload ke threadpool
+                    _prev_src = str(preview_path)
+                    _prev_dst = preview_remote_path
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: rclone._run_command(
+                            ["copyto", _prev_src, _prev_dst],
+                            timeout=60
+                        )
+                    )
 
                     if result.returncode == 0:
                         preview_uploaded = True
