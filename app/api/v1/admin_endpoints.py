@@ -2640,31 +2640,44 @@ def admin_list_storage(
     return {"items": items, "total": len(items)}
 
 
-@admin_router.post("/storage/{storage_id}/test")
+@admin_router.get("/storage/{storage_id}/test")
 def admin_test_storage(
     storage_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin"))
 ):
-    """[ADMIN] Test koneksi ke storage source"""
+    """[ADMIN] Test koneksi ke storage source (cek rclone remote status)."""
+    from app.services.rclone_service import RcloneService
+
     storage = db.query(StorageSource).filter(StorageSource.id == storage_id).first()
     if not storage:
         raise HTTPException(status_code=404, detail=f"Storage ID {storage_id} tidak ditemukan")
 
     try:
-        multi_remote = get_multi_remote_service()
-        health = multi_remote.get_health_status()
+        # ✅ Baca daemon status dari in-memory (tidak ada HTTP check, instant)
+        daemon_info = {}
+        for remote_name, daemon in RcloneService._serve_daemons.items():
+            is_alive = daemon["process"].poll() is None
+            daemon_url = daemon.get("url")
+            daemon_info[remote_name] = {
+                "alive": is_alive,
+                "ready": is_alive and daemon_url is not None,
+                "url": daemon_url,
+                "status": daemon.get("status", "unknown"),
+            }
+
+        total = len(daemon_info)
+        healthy = sum(1 for v in daemon_info.values() if v["ready"])
 
         return {
             "success": True,
             "storage_id": storage_id,
             "source_name": storage.source_name,
-            "multi_remote_enabled": settings.is_multi_remote_enabled,
-            "remotes_status": health["remotes"],
-            "total_remotes": health["total_remotes"],
-            "healthy_remotes": health["healthy_remotes"],
-            "available_remotes": health["available_remotes"],
-            # Group 2 info
+            "status": storage.status,
+            "total_remotes": total,
+            "healthy_remotes": healthy,
+            "available_remotes": healthy,
+            "remotes_status": daemon_info,
             "group2_configured": settings.is_next_group_configured,
             "group2_enabled": settings.is_group2_enabled,
         }
@@ -2678,6 +2691,82 @@ def admin_test_storage(
             "status": "error",
             "error": str(e)
         }
+
+
+
+
+@admin_router.get("/storage/gdrive-usage")
+async def get_gdrive_usage(
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Get real GDrive usage via 'rclone about' untuk semua remote di semua group.
+
+    ⚠️ Blocking (~1-3 detik per remote) — panggil hanya saat user klik Refresh manual.
+    Semua remote di-query secara PARALLEL untuk efisiensi.
+    """
+    import asyncio
+    from app.services.rclone_service import RcloneService
+    from app.services.storage_group_service import _get_all_configured_groups, _get_group_config
+
+    # Kumpulkan semua remote dari semua configured group
+    all_remotes = []
+    seen = set()
+    for g in _get_all_configured_groups():
+        cfg = _get_group_config(g)
+        if cfg:
+            for r in [cfg["primary"]] + cfg["backups"]:
+                if r and r not in seen:
+                    seen.add(r)
+                    all_remotes.append((g, r))
+
+    if not all_remotes:
+        return {
+            "groups": {},
+            "total_remotes_queried": 0,
+            "error": "Tidak ada remote yang dikonfigurasi",
+        }
+
+    # Query semua remote secara PARALLEL
+    loop = asyncio.get_event_loop()
+
+    async def query_one(group: int, remote_name: str) -> dict:
+        rclone = RcloneService._instances.get(remote_name)
+        if not rclone:
+            return {
+                "remote": remote_name, "group": group,
+                "total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0, "trashed_gb": 0.0,
+                "error": f"Instance tidak ditemukan untuk '{remote_name}'",
+            }
+        result = await loop.run_in_executor(None, rclone.get_about_info)
+        result["group"] = group
+        return result
+
+    results = await asyncio.gather(*[query_one(g, r) for g, r in all_remotes])
+
+    # Organisir per group
+    groups_output: Dict[str, dict] = {}
+    for item in results:
+        gk = str(item["group"])
+        if gk not in groups_output:
+            groups_output[gk] = {
+                "group": item["group"],
+                "remotes": [],
+                "total_used_gb": 0.0,
+                "total_free_gb": 0.0,
+                "total_capacity_gb": 0.0,
+            }
+        groups_output[gk]["remotes"].append(item)
+        if not item.get("error"):
+            groups_output[gk]["total_used_gb"] = round(groups_output[gk]["total_used_gb"] + item.get("used_gb", 0), 2)
+            groups_output[gk]["total_free_gb"] = round(groups_output[gk]["total_free_gb"] + item.get("free_gb", 0), 2)
+            groups_output[gk]["total_capacity_gb"] = round(groups_output[gk]["total_capacity_gb"] + item.get("total_gb", 0), 2)
+
+    return {
+        "groups": groups_output,
+        "total_remotes_queried": len(all_remotes),
+        "fetched_at": __import__("datetime").datetime.now().isoformat(),
+    }
 
 
 @admin_router.put("/storage/{storage_id}/status")
@@ -2929,73 +3018,48 @@ def admin_create_role(
 # ==========================================
 
 @admin_router.get("/groups/status")
-def get_groups_status(
+async def get_groups_status(
     current_user: User = Depends(require_role("admin"))
 ):
     """
-    [ADMIN] Get status semua storage group.
-
-    Returns info tentang:
-    - Group 1: primary + backup remotes (gdrive..gdrive10)
-    - Group 2: next primary + backup remotes (gdrive11..gdrive20)
-    - Active group untuk upload baru
-    - Daemon status per group
-    - Quota info
+    [ADMIN] Get status semua storage group (N-group support).
+    Fast: membaca data in-memory, tidak ada HTTP/blocking call.
     """
+    import asyncio
     try:
-        multi_remote = get_multi_remote_service()
+        from app.services.storage_group_service import get_storage_group_service
+        from app.services.rclone_service import RcloneService
 
-        # get_health_status() sudah return semua info termasuk group2 nested di dalamnya
-        health = multi_remote.get_health_status()
+        # ✅ Jalankan di thread pool agar tidak block event loop
+        loop = asyncio.get_event_loop()
+        sgs = get_storage_group_service()
+        status = await loop.run_in_executor(None, sgs.get_status)
 
-        # Ambil group 1 info dari health response
-        g1_remotes = health.get("remotes", [])
-        g1_total = health.get("total_remotes", 0)
-        g1_healthy = health.get("healthy_remotes", 0)
-        g1_available = health.get("available_remotes", 0)
-        g1_daemons = health.get("serve_daemons_running", 0)
-        g1_daemon_urls = health.get("active_daemon_urls", [])
+        # ✅ Daemon status dari in-memory registry (instantaneous)
+        daemon_info = {}
+        for remote_name, daemon in RcloneService._serve_daemons.items():
+            is_alive = daemon["process"].poll() is None
+            daemon_url = daemon.get("url")  # None jika masih starting
+            daemon_info[remote_name] = {
+                "alive": is_alive,
+                "ready": is_alive and daemon_url is not None,
+                "url": daemon_url,
+                "port": daemon.get("port"),
+                "status": daemon.get("status", "unknown"),
+            }
 
-        # Ambil group 2 info dari nested key "group2"
-        g2_info = health.get("group2", {})
-        g2_remotes = g2_info.get("remotes", [])
-        g2_total = g2_info.get("total_remotes", 0)
-        g2_healthy = g2_info.get("healthy_remotes", 0)
-        g2_available = g2_info.get("available_remotes", 0)
-        g2_daemons = g2_info.get("serve_daemons_running", 0)
-        g2_daemon_urls = g2_info.get("active_daemon_urls", [])
-
-        active_group = multi_remote.get_active_upload_group()
+        g1_ready = sum(1 for v in daemon_info.values() if v["ready"])
 
         return {
-            "active_upload_group": active_group,
-            "group2_path_prefix": settings.GROUP2_PATH_PREFIX,
-            "auto_switch_group": settings.RCLONE_AUTO_SWITCH_GROUP,
-            "group1": {
-                "primary": settings.RCLONE_PRIMARY_REMOTE,
-                "backups": settings.get_secondary_remotes(),
-                "all_remotes": settings.get_rclone_remotes(),
-                "quota_limit_gb": settings.RCLONE_GROUP1_QUOTA_GB,
-                "total_remotes": g1_total,
-                "healthy_remotes": g1_healthy,
-                "available_remotes": g1_available,
-                "serve_daemons_running": g1_daemons,
-                "active_daemon_urls": g1_daemon_urls,
-                "remotes": g1_remotes,
-            },
-            "group2": {
-                "configured": settings.is_next_group_configured,
-                "enabled": settings.is_group2_enabled,
-                "primary": settings.RCLONE_NEXT_PRIMARY_REMOTE or None,
-                "backups": settings.get_next_backup_remotes(),
-                "all_remotes": settings.get_next_group_remotes(),
-                "total_remotes": g2_total,
-                "healthy_remotes": g2_healthy,
-                "available_remotes": g2_available,
-                "serve_daemons_running": g2_daemons,
-                "active_daemon_urls": g2_daemon_urls,
-                "remotes": g2_remotes,
-                "path_prefix": settings.GROUP2_PATH_PREFIX,
+            "active_upload_group": status["active_upload_group"],
+            "auto_switch_enabled": status["auto_switch_enabled"],
+            "configured_groups": status["configured_groups"],
+            "groups": status["groups"],
+            "quota": status["quota"],
+            "daemon_health": {
+                "group1_daemons_ready": g1_ready,
+                "group1_daemons_total": len(daemon_info),
+                "daemons": daemon_info,
             },
         }
 
@@ -3004,108 +3068,79 @@ def get_groups_status(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 @admin_router.post("/groups/switch")
 def manual_switch_group(
-    target_group: int = Query(..., ge=1, le=2, description="Target group (1 atau 2)"),
+    target_group: int = Query(..., ge=1, description="Target group (1, 2, 3, ...)"),
     current_user: User = Depends(require_role("admin"))
 ):
     """
-    [ADMIN] Manual switch active upload group.
+    [ADMIN] Manual switch active upload group ke group N.
 
-    - target_group=1 → Upload ke Group 1 (gdrive, gdrive1..gdrive10), path tanpa prefix
-    - target_group=2 → Upload ke Group 2 (gdrive11..gdrive20), path dengan prefix '@'
+    - target_group=1 → Upload ke Group 1, path tanpa prefix
+    - target_group=2 → Upload ke Group 2, path dengan prefix @2/
+    - target_group=3 → Upload ke Group 3, path dengan prefix @3/
+    - dst.
 
     Berguna untuk:
-    - Force switch ke group 2 sebelum group 1 penuh
-    - Fallback ke group 1 jika group 2 bermasalah
+    - Force switch ke group berikutnya sebelum group aktif penuh
+    - Fallback ke group sebelumnya jika ada masalah
     """
     try:
-        if target_group == 2 and not settings.is_next_group_configured:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Group 2 belum dikonfigurasi. "
-                    "Set RCLONE_NEXT_PRIMARY_REMOTE di .env terlebih dahulu."
-                )
-            )
+        from app.services.storage_group_service import get_storage_group_service, get_group_prefix
+        sgs = get_storage_group_service()
+        result = sgs.switch_upload_group(target_group)
 
-        multi_remote = get_multi_remote_service()
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail=result.get("error", "Switch failed"))
 
-        # ✅ set_active_upload_group() ada di MultiRemoteService
-        # (validates group 2 tersedia sebelum switch)
-        multi_remote.set_active_upload_group(target_group)
-
+        admin_user = getattr(current_user, 'username', 'admin')
         logger.info(
-            f"Admin {current_user.username} manually switched active upload group to G{target_group}"
-        )
-
-        path_info = (
-            f"Path baru akan disimpan dengan prefix '{settings.GROUP2_PATH_PREFIX}' di database"
-            if target_group == 2
-            else "Path baru akan disimpan tanpa prefix (group 1 normal)"
-        )
-
-        primary_remote = (
-            settings.RCLONE_NEXT_PRIMARY_REMOTE
-            if target_group == 2
-            else settings.RCLONE_PRIMARY_REMOTE
+            f"Admin '{admin_user}' manually switched active upload group "
+            f"from G{result['previous_group']} to G{target_group}"
         )
 
         return {
             "success": True,
-            "message": f"Active upload group berhasil dipindah ke Group {target_group}",
-            "active_group": target_group,
-            "primary_remote": primary_remote,
-            "path_prefix": settings.GROUP2_PATH_PREFIX if target_group == 2 else "",
-            "note": path_info,
+            "message": result["message"],
+            "previous_group": result["previous_group"],
+            "active_group": result["active_group"],
+            "primary_remote": result.get("remote"),
+            "path_prefix": result.get("prefix", ""),
         }
 
     except HTTPException:
         raise
-    except RuntimeError as e:
-        # RuntimeError dari set_active_upload_group jika group 2 tidak ready
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to switch group: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @admin_router.get("/groups/quota")
-def get_groups_quota_info(
+async def get_groups_quota_info(
     current_user: User = Depends(require_role("admin"))
 ):
     """
     [ADMIN] Get quota info untuk semua group.
-
-    Returns:
-    - Group 1 quota usage & limit
-    - Group 2 konfigurasi
-    - Active upload group
-    - Auto-switch status
+    Fast: membaca data in-memory, tidak ada HTTP/blocking call.
     """
-    multi_remote = get_multi_remote_service()
-    active_group = multi_remote.get_active_upload_group()
-
-    # Coba ambil dari StorageGroupService jika tersedia
-    quota_stats = None
+    import asyncio
     try:
-        from app.services.storage_group_service import GroupQuotaTracker
-        quota_stats = GroupQuotaTracker.get_instance().get_stats()
+        from app.services.storage_group_service import GroupQuotaTracker, get_storage_group_service
+        loop = asyncio.get_event_loop()
+        quota_stats = await loop.run_in_executor(
+            None, GroupQuotaTracker.get_instance().get_stats
+        )
+        active_group = get_storage_group_service().get_upload_group()
     except Exception as e:
-        logger.warning(f"Could not get quota stats from StorageGroupService: {str(e)}")
+        logger.warning(f"Could not get quota stats: {str(e)}")
+        quota_stats = {"error": str(e)}
+        active_group = 1
 
     return {
         "active_upload_group": active_group,
         "auto_switch_enabled": settings.RCLONE_AUTO_SWITCH_GROUP,
         "group1_quota_limit_gb": settings.RCLONE_GROUP1_QUOTA_GB,
-        "group1_quota_note": (
-            "0 = unlimited / manual switch only"
-            if settings.RCLONE_GROUP1_QUOTA_GB == 0
-            else f"Auto-switch to group 2 when usage >= {settings.RCLONE_GROUP1_QUOTA_GB} GB"
-        ),
-        "group2_configured": settings.is_next_group_configured,
-        "group2_enabled": settings.is_group2_enabled,
-        "group2_path_prefix": settings.GROUP2_PATH_PREFIX,
         "quota_tracker": quota_stats,
     }
 
@@ -3121,13 +3156,14 @@ def validate_file_path(file_path: str) -> str:
     """
     Validate file path to prevent path traversal attacks.
 
-    ✅ GROUP AWARE: path boleh dimulai dengan GROUP2_PATH_PREFIX ('@')
+    ✅ N-GROUP AWARE: path boleh dimulai dengan @N/ prefix
+    (e.g., @2/manga/xxx/001.jpg, @3/manga/xxx/001.jpg)
     karena itu adalah group marker, bukan path traversal.
     Strip prefix dulu sebelum validasi.
     """
-    # ✅ Strip group prefix sebelum validasi keamanan
-    # Gunakan settings.clean_path() bukan lstrip() karena lstrip strip per-karakter
-    check_path = settings.clean_path(file_path)
+    # ✅ Strip group prefix sebelum validasi keamanan (support @N/ format baru + @ legacy)
+    from app.services.storage_group_service import clean_path as sgs_clean_path
+    check_path = sgs_clean_path(file_path)
 
     if ".." in check_path or check_path.startswith("/") or "\\" in check_path:
         logger.warning(f"Path traversal attempt detected: {file_path}")
@@ -3148,8 +3184,9 @@ def validate_file_path(file_path: str) -> str:
 
 def get_image_content_type(filename: str) -> str:
     """Get content type based on file extension"""
-    # Strip group prefix sebelum ambil extension
-    clean = settings.clean_path(filename)
+    # Strip group prefix sebelum ambil extension (support @N/ format baru)
+    from app.services.storage_group_service import clean_path as sgs_clean_path
+    clean = sgs_clean_path(filename)
     extension = clean.lower().split(".")[-1]
 
     content_types = {
@@ -3161,6 +3198,7 @@ def get_image_content_type(filename: str) -> str:
     }
 
     return content_types.get(extension, "image/jpeg")
+
 
 
 async def _get_daemon_url_for_file(
@@ -3250,19 +3288,25 @@ async def get_image_proxy(
     request_id = getattr(request.state, "request_id", "unknown")
 
     try:
-        # ✅ Validate path (boleh ada '@' prefix untuk group 2)
+        # ✅ Validate path (boleh ada '@N/' prefix untuk group N)
         validated_path = validate_file_path(gdrive_file_path)
         content_type = get_image_content_type(validated_path)
 
-        # ✅ Determine group dari prefix
-        is_group2 = settings.is_group2_path(validated_path)
-        active_group = 2 if is_group2 else 1
+        # ✅ Determine group dari prefix — support semua group (@2/, @3/, dst.)
+        from app.services.storage_group_service import (
+            get_group_for_path as _get_group_for_path,
+            clean_path as _clean_path_sgs,
+        )
+        active_group = _get_group_for_path(validated_path)
 
-        # ✅ Strip prefix '@' untuk actual file path ke rclone/daemon
-        # PENTING: gunakan settings.clean_path(), BUKAN lstrip()
-        # lstrip("@") strip setiap '@' karakter dari kiri,
-        # sedangkan clean_path() strip string prefix "@" dengan benar.
-        clean_path = settings.clean_path(validated_path)
+        # ✅ Strip prefix @N/ untuk actual file path ke rclone/daemon
+        # PENTING: gunakan storage_group_service.clean_path() — mendukung:
+        #   - Format baru: @2/manga/... → manga/...
+        #   - Format baru: @3/manga/... → manga/...
+        #   - Legacy:      @manga/...   → manga/...
+        #   - Group 1:     manga/...    → manga/... (no-op)
+        # settings.clean_path() hanya strip '@' (legacy saja) → SALAH untuk @2/ dst.
+        clean_path = _clean_path_sgs(validated_path)
 
         logger.info(
             "Image proxy request",
@@ -3572,4 +3616,47 @@ async def get_proxy_stats():
                 "~1-3s streaming (daemon round robin), ~2-5s fallback (cat)"
             ),
         },
+    }
+
+
+# ==========================================
+# IMGURL TOKEN MONITORING
+# ==========================================
+
+@admin_router.get("/imgurl/token-status")
+def get_imgurl_token_status(
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Status token imgurl.org untuk upload foto profil.
+
+    Menampilkan:
+    - Jumlah token terdaftar
+    - Posisi round-robin saat ini
+    - Usage harian per token (in-memory, reset saat restart)
+    """
+    from app.services.imgurl_service import get_token_status
+    return {
+        "status": "ok",
+        "token_file": "storage/imgurl_tokens.json",
+        "daily_limit_per_token": 30,
+        "rotation_strategy": "round-robin",
+        **get_token_status()
+    }
+
+
+@admin_router.post("/imgurl/reload-tokens")
+def reload_imgurl_tokens(
+    current_user: User = Depends(require_role("admin"))
+):
+    """
+    [ADMIN] Reload token imgurl.org dari file tanpa restart server.
+
+    Panggil ini setelah edit storage/imgurl_tokens.json untuk apply perubahan.
+    """
+    from app.services.imgurl_service import reload_tokens
+    result = reload_tokens()
+    return {
+        "message": f"✅ Token reloaded: {result['total_tokens']} token(s) aktif",
+        **result
     }

@@ -150,16 +150,39 @@ class Settings(BaseSettings):
     RCLONE_NEXT_BACKUP_REMOTES: str = ""
 
     # Quota threshold group 1 dalam GB sebelum auto-switch ke group 2
-    # Contoh: 1900 = switch kalau group 1 sudah terpakai >= 1900 GB
-    # Set 0 = tidak auto-switch berdasarkan quota (manual switch)
     RCLONE_GROUP1_QUOTA_GB: int = 0
 
-    # Enable/disable auto switch ke group 2 saat group 1 penuh
+    # Quota threshold group 2 dalam GB sebelum auto-switch ke group 3
+    RCLONE_GROUP2_QUOTA_GB: int = 1900
+
+    # Enable/disable auto switch ke group berikutnya saat group aktif penuh
     RCLONE_AUTO_SWITCH_GROUP: bool = False
 
-    # Prefix yang dipakai di database path untuk menandai file group 2
-    # Default '@' → path group 2: "@manga_library/xxx/001.jpg"
+    # Prefix lama group 2 (backward compat — '@' tanpa angka)
+    # Format baru: @2/, @3/, @4/ (numeric prefix)
     GROUP2_PATH_PREFIX: str = "@"
+
+    # ==========================================
+    # ✅ GROUP 3 Configuration
+    # Set RCLONE_GROUP_3_PRIMARY di .env untuk aktifkan group 3
+    # ==========================================
+    RCLONE_GROUP_3_PRIMARY: str = ""
+    RCLONE_GROUP_3_BACKUPS: str = ""
+    RCLONE_GROUP_3_QUOTA_GB: int = 1900
+
+    # ==========================================
+    # ✅ GROUP 4 Configuration
+    # ==========================================
+    RCLONE_GROUP_4_PRIMARY: str = ""
+    RCLONE_GROUP_4_BACKUPS: str = ""
+    RCLONE_GROUP_4_QUOTA_GB: int = 1900
+
+    # ==========================================
+    # ✅ GROUP 5 Configuration
+    # ==========================================
+    RCLONE_GROUP_5_PRIMARY: str = ""
+    RCLONE_GROUP_5_BACKUPS: str = ""
+    RCLONE_GROUP_5_QUOTA_GB: int = 1900
 
     # ==========================================
     # ✅ ✨ RCLONE SERVE HTTP MODE (PRIMARY FIELDS)
@@ -829,6 +852,9 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = 'utf-8'
         case_sensitive = True
+        # ✅ 'ignore' agar env vars grup N+ (RCLONE_GROUP_6_PRIMARY, dll)
+        # yang belum didefinisikan tidak menyebabkan ValidationError
+        extra = 'ignore'
 
 
 # ==========================================

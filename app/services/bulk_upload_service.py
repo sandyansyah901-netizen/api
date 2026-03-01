@@ -767,7 +767,7 @@ class BulkUploadService:
 
             # 3. Create chapter record di DB
             if self.db:
-                from app.models.models import Chapter, Page
+                from app.models.models import Chapter, Page, Manga, utcnow as _utcnow
 
                 chapter_slug = generate_chapter_slug(manga_slug, chapter_main, chapter_sub)
 
@@ -836,6 +836,11 @@ class BulkUploadService:
                         logger.error(f"❌ Error generating thumbnail: {str(e)}, using page 1")
                         new_chapter.anchor_path = first_page["gdrive_path"]
                         new_chapter.preview_url = f"/api/v1/image-proxy/image/{first_page['gdrive_path']}"
+
+                # ✅ Update manga.updated_at agar tetap sinkron dengan chapter terbaru
+                manga_obj = self.db.query(Manga).filter(Manga.id == manga_id).first()
+                if manga_obj:
+                    manga_obj.updated_at = _utcnow()
 
                 self.db.commit()
 

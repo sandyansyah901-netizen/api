@@ -14,9 +14,10 @@ REVISI:
 ✅ NEW: Tambah endpoint async /suggest untuk autocomplete search judul komik
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import Optional, List
 from datetime import timedelta, datetime, timezone  # ✅ FIX #3: Added timezone import
 from pathlib import Path
@@ -188,6 +189,131 @@ def logout(current_user: User = Depends(get_current_user)):
     }
 
 
+@auth_router.post("/avatar/upload")
+async def upload_avatar(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Upload foto profil ke imgurl.org dan simpan URL di database.
+
+    - Format: JPG, PNG, WEBP, GIF (max 10MB)
+    - Token imgurl.org dirotasi round-robin otomatis
+    - URL gambar disimpan di kolom avatar_url pada tabel users
+
+    Request: multipart/form-data dengan field 'file'
+    """
+    from app.services.imgurl_service import upload_to_imgurl
+
+    # Validasi format file
+    ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    content_type = file.content_type or "image/jpeg"
+    if content_type not in ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Format tidak didukung: {content_type}. Gunakan JPG, PNG, WEBP, atau GIF."
+        )
+
+    # Validasi ukuran file max 10MB
+    MAX_SIZE = 10 * 1024 * 1024  # 10MB
+    file_content = await file.read()
+    if len(file_content) > MAX_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Ukuran file terlalu besar ({len(file_content)//1024}KB). Maksimal 10MB."
+        )
+
+    # Upload ke imgurl.org
+    result = await upload_to_imgurl(
+        file_content=file_content,
+        filename=file.filename or "avatar.jpg",
+        content_type=content_type,
+    )
+
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Upload gagal: {result.get('error', 'Unknown error')}"
+        )
+
+    # Simpan URL ke database
+    image_url = result["url"]
+    old_avatar = current_user.avatar_url
+    current_user.avatar_url = image_url
+    db.commit()
+    db.refresh(current_user)
+
+    logger.info(f"✅ Avatar updated for user '{current_user.username}': {image_url}")
+
+    return {
+        "message": "Foto profil berhasil diperbarui",
+        "avatar_url": image_url,
+        "thumbnail_url": result.get("thumbnail_url"),
+        "imgid": result.get("imgid"),
+        "old_avatar_url": old_avatar,
+        "user": {
+            "id": current_user.id,
+            "username": current_user.username,
+        }
+    }
+
+
+@auth_router.put("/avatar/url")
+def update_avatar_url(
+    avatar_url: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Update foto profil dengan URL langsung (tanpa upload).
+
+    Gunakan ini jika sudah punya URL gambar eksternal.
+    URL harus dimulai dengan http:// atau https://
+    """
+    if not avatar_url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="URL harus dimulai dengan http:// atau https://"
+        )
+
+    if len(avatar_url) > 512:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="URL terlalu panjang (maksimal 512 karakter)"
+        )
+
+    old_avatar = current_user.avatar_url
+    current_user.avatar_url = avatar_url
+    db.commit()
+    db.refresh(current_user)
+
+    logger.info(f"✅ Avatar URL updated for '{current_user.username}': {avatar_url}")
+
+    return {
+        "message": "URL foto profil berhasil diperbarui",
+        "avatar_url": avatar_url,
+        "old_avatar_url": old_avatar,
+    }
+
+
+@auth_router.delete("/avatar")
+def delete_avatar(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Hapus foto profil (set ke null).
+    """
+    if not current_user.avatar_url:
+        return {"message": "Tidak ada foto profil untuk dihapus"}
+
+    current_user.avatar_url = None
+    db.commit()
+
+    return {"message": "Foto profil berhasil dihapus"}
+
+
 # ==========================================
 # MANGA ROUTER
 # ==========================================
@@ -245,7 +371,10 @@ def list_manga(
     type_slug: Optional[str] = Query(None, description="Filter by manga type"),
     genre_slug: Optional[str] = Query(None, description="Filter by genre"),
     status: Optional[str] = Query(None, description="Filter by status (ongoing/completed)"),
-    sort_by: str = Query("updated_at", description="Sort by: title | created_at | updated_at"),
+    sort_by: str = Query(
+        "latest_chapter",
+        description="Sort by: title | created_at | updated_at | latest_chapter"
+    ),
     sort_order: str = Query("desc", description="Sort order: asc | desc"),
     db: Session = Depends(get_db)
 ):
@@ -259,47 +388,96 @@ def list_manga(
     - Pagination
     - ✅ Show cover images
     - ✅ Show description
+    - ✅ sort_by=latest_chapter → sort by MAX(chapter.created_at) per manga
     """
-    query = db.query(Manga)
-    
+    # ✅ Subquery: ambil created_at chapter terbaru untuk tiap manga
+    latest_chapter_sq = (
+        db.query(
+            Chapter.manga_id,
+            func.max(Chapter.created_at).label("latest_chapter_at")
+        )
+        .group_by(Chapter.manga_id)
+        .subquery()
+    )
+
+    # ✅ FIX: count query TERPISAH — query.count() gagal pada multi-entity query
+    count_q = db.query(func.count(Manga.id)).outerjoin(
+        latest_chapter_sq, Manga.id == latest_chapter_sq.c.manga_id
+    )
+
+    if search:
+        count_q = count_q.filter(Manga.title.ilike(f"%{search}%"))
+    if type_slug:
+        count_q = count_q.join(MangaType).filter(MangaType.slug == type_slug)
+    if genre_slug:
+        count_q = count_q.join(Manga.genres).filter(Genre.slug == genre_slug)
+    if status:
+        count_q = count_q.filter(Manga.status == status)
+    total = count_q.scalar() or 0
+
+    # ✅ Main query: Join Manga dengan subquery latest chapter
+    query = db.query(
+        Manga,
+        latest_chapter_sq.c.latest_chapter_at
+    ).outerjoin(
+        latest_chapter_sq,
+        Manga.id == latest_chapter_sq.c.manga_id
+    )
+
     # Search filter
     if search:
         query = query.filter(Manga.title.ilike(f"%{search}%"))
-    
+
     # Type filter
     if type_slug:
         query = query.join(MangaType).filter(MangaType.slug == type_slug)
-    
+
     # Genre filter
     if genre_slug:
         query = query.join(Manga.genres).filter(Genre.slug == genre_slug)
-    
+
     # Status filter
     if status:
         query = query.filter(Manga.status == status)
     
-    # Sorting
-    sort_column = getattr(Manga, sort_by, Manga.updated_at)
-    if sort_order == "asc":
-        query = query.order_by(sort_column.asc())
+    # ✅ Sorting - handle special case 'latest_chapter'
+    if sort_by == "latest_chapter":
+        # ✅ FIX: Pakai func.coalesce agar NULL tidak error, compatible semua SQLAlchemy
+        # NULL = manga tanpa chapter → coalesce ke datetime paling lama = muncul paling bawah
+        from sqlalchemy import text as sa_text
+        null_sentinel = sa_text("'1970-01-01 00:00:00'")
+        coalesced_dt = func.coalesce(latest_chapter_sq.c.latest_chapter_at, null_sentinel)
+        if sort_order == "asc":
+            query = query.order_by(coalesced_dt.asc())
+        else:
+            query = query.order_by(coalesced_dt.desc())
     else:
-        query = query.order_by(sort_column.desc())
-    
-    # Get total count before pagination
-    total = query.count()
+        # Sort berdasarkan kolom Manga (title, created_at, updated_at)
+        sort_column = getattr(Manga, sort_by, Manga.updated_at)
+        if sort_order == "asc":
+            query = query.order_by(sort_column.asc())
+        else:
+            query = query.order_by(sort_column.desc())
     
     # Apply pagination
-    manga_list = query.offset((page - 1) * page_size).limit(page_size).all()
+    results = query.offset((page - 1) * page_size).limit(page_size).all()
     
     # Format response
     items = []
-    for m in manga_list:
+    for row in results:
+        m = row[0]                        # Manga object
+        latest_chapter_at = row[1]        # datetime | None
+
+        # Cari chapter terbaru (by chapter_main & chapter_sub)
+        sorted_chapters = sorted(m.chapters, key=lambda c: (c.chapter_main, c.chapter_sub))
+        latest_chapter_label = sorted_chapters[-1].chapter_label if sorted_chapters else None
+
         items.append({
             "id": m.id,
             "title": m.title,
             "slug": m.slug,
-            "description": m.description,  # ✅ ADDED
-            "cover_url": get_cover_url(m.cover_image_path),  # ✅ ADDED
+            "description": m.description,
+            "cover_url": get_cover_url(m.cover_image_path),
             "status": m.status,
             "type": {
                 "id": m.manga_type.id,
@@ -311,7 +489,8 @@ def list_manga(
                 for g in m.genres
             ],
             "total_chapters": len(m.chapters),
-            "latest_chapter": m.chapters[-1].chapter_label if m.chapters else None,
+            "latest_chapter": latest_chapter_label,
+            "latest_chapter_at": latest_chapter_at,  # ✅ NEW: kapan chapter terakhir diupload
             "updated_at": m.updated_at
         })
     

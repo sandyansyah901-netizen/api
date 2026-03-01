@@ -306,10 +306,15 @@ class RcloneService:
 
     def _start_serve_daemon_once(self):
         """
-        ✅ ✨ FIXED: Start rclone serve http HANYA JIKA belum running.
+        ✅ NON-BLOCKING: Start rclone serve http di background thread.
 
-        Sebelumnya: _start_serve_daemon() tidak cek apakah sudah running
-        Sekarang: cek _serve_daemons[remote_name] dulu, skip jika sudah ada
+        Server startup tidak menunggu daemon siap.
+        Daemon health check dilakukan di background:
+        - Polling tiap 0.5s hingga 60s
+        - Jika berhasil → URL tersimpan di _serve_daemons, siap dipakai
+        - Jika gagal → fallback ke 'rclone cat' tetap berjalan
+
+        Thread-safe: gunakan _serve_lock saat akses _serve_daemons.
         """
         with self._serve_lock:
             # ✅ Cek apakah daemon untuk remote ini sudah running
@@ -322,13 +327,29 @@ class RcloneService:
                     )
                     return
                 else:
-                    # Process sudah mati, hapus entry lama
                     logger.warning(f"⚠️ Serve daemon for '{self.remote_name}' was dead, restarting...")
                     del self._serve_daemons[self.remote_name]
 
-            # Allocate port
-            port = settings.RCLONE_SERVE_HTTP_PORT_START + self._serve_port_counter
+            # Allocate port — worker-aware formula:
+            # PORT = BASE_PORT + (worker_index * 20) + remote_counter
+            # - worker_index: from WORKER_INDEX env var (set by gunicorn post_fork)
+            #   → 0 when not set = single worker mode (uvicorn dev), backward compat
+            # - 20 port slots per worker = supports up to 20 remotes per worker
+            # - remote_counter: increments per remote within this worker process
+            # Example with 3 workers + 3 remotes:
+            #   Worker 0: gdrive→8180, gdrive1→8181, gdrive2→8182
+            #   Worker 1: gdrive→8200, gdrive1→8201, gdrive2→8202
+            #   Worker 2: gdrive→8220, gdrive1→8221, gdrive2→8222
+            _worker_index = int(os.environ.get("WORKER_INDEX", "0"))
+            _worker_port_offset = _worker_index * int(os.environ.get("WORKER_PORT_SLOTS", "20"))
+            port = settings.RCLONE_SERVE_HTTP_PORT_START + _worker_port_offset + self._serve_port_counter
             RcloneService._serve_port_counter += 1
+
+            if _worker_index > 0:
+                logger.info(
+                    f"🔢 Worker {_worker_index}: port offset={_worker_port_offset}, "
+                    f"allocated port={port} for '{self.remote_name}'"
+                )
 
             host = settings.RCLONE_SERVE_HTTP_HOST
             addr = f"{host}:{port}"
@@ -361,65 +382,92 @@ class RcloneService:
             try:
                 logger.info(f"🚀 Starting serve daemon for '{self.remote_name}' on port {port}...")
 
-                # ✅ FIX: Clean RCLONE_* env vars untuk serve daemon juga
                 clean_env = _clean_env_for_rclone()
 
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    env=clean_env  # ✅ ADDED
+                    env=clean_env
                 )
 
-                # Wait & health check dengan httpx.Client (sync, karena di __init__)
-                startup_timeout = settings.RCLONE_SERVE_HTTP_STARTUP_TIMEOUT
-                deadline = time.time() + startup_timeout
-                started = False
-
-                while time.time() < deadline:
-                    if process.poll() is not None:
-                        # Process sudah exit → gagal
-                        stderr = b""
-                        try:
-                            stderr = process.stderr.read()
-                        except Exception:
-                            pass
-                        error_msg = stderr.decode('utf-8', errors='ignore')
-                        logger.error(
-                            f"❌ Serve daemon failed to start for '{self.remote_name}': {error_msg}"
-                        )
-                        return
-
-                    # ✅ Health check via httpx.Client (sync)
-                    try:
-                        with httpx.Client(timeout=2.0) as client:
-                            resp = client.get(url)
-                            if resp.status_code < 500:
-                                started = True
-                                break
-                    except Exception:
-                        time.sleep(0.5)
-
-                if started:
-                    self._serve_daemons[self.remote_name] = {
-                        "process": process,
-                        "port": port,
-                        "url": url,
-                        "started_at": time.time()
-                    }
-                    logger.info(f"✅ Serve daemon started: http://{addr}")
-                else:
-                    logger.error(
-                        f"❌ Serve daemon failed to start within {startup_timeout}s "
-                        f"for '{self.remote_name}'"
-                    )
-                    process.terminate()
+                # ✅ NON-BLOCKING: simpan process dulu dengan status "starting"
+                # Background thread akan update ke "running" setelah health check OK
+                self._serve_daemons[self.remote_name] = {
+                    "process": process,
+                    "port": port,
+                    "url": None,  # None = belum siap, image proxy pakai fallback
+                    "started_at": time.time(),
+                    "status": "starting",
+                }
 
             except Exception as e:
                 logger.error(
-                    f"❌ Failed to start serve daemon for '{self.remote_name}': {str(e)}",
+                    f"❌ Failed to launch serve daemon for '{self.remote_name}': {str(e)}",
                     exc_info=True
                 )
+                return
+
+        # ✅ Health check di background thread (tidak block __init__)
+        remote_name = self.remote_name
+        startup_timeout = settings.RCLONE_SERVE_HTTP_STARTUP_TIMEOUT
+
+        def _background_health_check():
+            deadline = time.time() + startup_timeout
+            while time.time() < deadline:
+                with self._serve_lock:
+                    entry = self._serve_daemons.get(remote_name)
+                    if not entry:
+                        return  # Daemon dihapus (shutdown)
+                    process = entry["process"]
+
+                if process.poll() is not None:
+                    # Process sudah exit → gagal
+                    try:
+                        stderr_out = process.stderr.read()
+                        error_msg = stderr_out.decode('utf-8', errors='ignore').strip()
+                    except Exception:
+                        error_msg = "(no stderr)"
+                    logger.error(
+                        f"❌ Serve daemon for '{remote_name}' exited early. "
+                        f"stderr: {error_msg[:300]}"
+                    )
+                    with self._serve_lock:
+                        self._serve_daemons.pop(remote_name, None)
+                    return
+
+                # HTTP health check
+                try:
+                    with httpx.Client(timeout=2.0) as client:
+                        resp = client.get(url)
+                        if resp.status_code < 500:
+                            with self._serve_lock:
+                                if remote_name in self._serve_daemons:
+                                    self._serve_daemons[remote_name]["url"] = url
+                                    self._serve_daemons[remote_name]["status"] = "running"
+                            logger.info(f"✅ Serve daemon ready: {url} (remote: {remote_name})")
+                            return
+                except Exception:
+                    pass
+
+                time.sleep(0.5)
+
+            # Timeout habis
+            logger.error(
+                f"❌ Serve daemon for '{remote_name}' not ready within {startup_timeout}s. "
+                f"Image proxy will use rclone cat fallback."
+            )
+            # Jangan terminate — biarkan tetap jalan, mungkin baru butuh lebih lama
+            # Jika diakses lagi nanti lewat get_serve_url() → None → pakai fallback
+
+        thread = threading.Thread(
+            target=_background_health_check,
+            name=f"daemon-health-{remote_name}",
+            daemon=True
+        )
+        thread.start()
+
+
 
     def _stop_serve_daemon(self):
         """Stop serve daemon untuk remote ini."""
@@ -444,33 +492,43 @@ class RcloneService:
                 del self._serve_daemons[self.remote_name]
 
     def is_serve_running(self) -> bool:
-        """Check apakah serve daemon sedang running untuk remote ini."""
+        """Check apakah serve daemon sudah SIAP (bukan sekedar starting)."""
         daemon = self._serve_daemons.get(self.remote_name)
         if not daemon:
             return False
-        return daemon["process"].poll() is None
+        # ✅ Harus process running DAN url sudah tersedia (health check OK)
+        return daemon["process"].poll() is None and daemon.get("url") is not None
 
     def get_serve_url(self) -> Optional[str]:
-        """Get URL serve daemon untuk remote ini. None jika tidak running."""
+        """Get URL serve daemon. None jika tidak running ATAU masih starting."""
         daemon = self._serve_daemons.get(self.remote_name)
-        if daemon and daemon["process"].poll() is None:
-            return daemon["url"]
-        return None
+        if not daemon:
+            return None
+        if daemon["process"].poll() is not None:
+            return None
+        # ✅ Kembalikan URL hanya jika health check sudah OK (url != None)
+        return daemon.get("url")  # None jika masih starting
 
     def get_serve_daemon_status(self) -> Dict:
         """Get serve daemon status untuk remote ini."""
         daemon = self._serve_daemons.get(self.remote_name)
         if not daemon:
-            return {"running": False, "remote": self.remote_name}
+            return {"running": False, "status": "not_started", "remote": self.remote_name}
 
-        is_running = daemon["process"].poll() is None
+        is_alive = daemon["process"].poll() is None
+        is_ready = is_alive and daemon.get("url") is not None
+        daemon_status = daemon.get("status", "unknown")
+
         return {
-            "running": is_running,
+            "running": is_ready,
+            "status": daemon_status if is_alive else "dead",
             "remote": self.remote_name,
-            "url": daemon["url"] if is_running else None,
+            "url": daemon.get("url") if is_ready else None,
             "port": daemon["port"],
-            "uptime_seconds": round(time.time() - daemon["started_at"], 2) if is_running else 0
+            "uptime_seconds": round(time.time() - daemon["started_at"], 2) if is_alive else 0
         }
+
+
 
     # ==========================================
     # ✅ ✨ DOWNLOAD VIA HTTPX (ASYNC - METHODS BARU)
@@ -1225,6 +1283,72 @@ class RcloneService:
         except Exception as e:
             logger.error(f"❌ Rclone connection test: FAILED - {str(e)}")
             return False
+
+    def get_about_info(self, timeout: int = 30) -> Dict:
+        """
+        Get real GDrive usage via 'rclone about {remote}: --json'.
+
+        Returns dict berisi:
+          - total_bytes: total kapasitas (bytes)
+          - used_bytes: terpakai (bytes)
+          - free_bytes: sisa (bytes)
+          - total_gb, used_gb, free_gb: versi GB (float, 2 decimal)
+          - remote: nama remote
+          - error: None atau string error
+
+        Ini blocking call (~1-3 detik per remote).
+        Panggil dari run_in_executor agar tidak block event loop.
+        """
+        import json as _json
+
+        try:
+            result = self._run_command(
+                ["about", f"{self.remote_name}:", "--json"],
+                timeout=timeout
+            )
+
+            if result.returncode != 0:
+                err = result.stderr.strip() or "rclone about returned non-zero"
+                logger.warning(f"rclone about failed for '{self.remote_name}': {err}")
+                return {
+                    "remote": self.remote_name,
+                    "total_bytes": 0, "used_bytes": 0, "free_bytes": 0,
+                    "total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0,
+                    "error": err,
+                }
+
+            data = _json.loads(result.stdout)
+            total = data.get("total", 0) or 0
+            used = data.get("used", 0) or 0
+            free = data.get("free", 0) or (total - used)
+            trashed = data.get("trashed", 0) or 0
+
+            def to_gb(b: int) -> float:
+                return round(b / (1024 ** 3), 2)
+
+            return {
+                "remote": self.remote_name,
+                "total_bytes": total,
+                "used_bytes": used,
+                "free_bytes": free,
+                "trashed_bytes": trashed,
+                "total_gb": to_gb(total),
+                "used_gb": to_gb(used),
+                "free_gb": to_gb(free),
+                "trashed_gb": to_gb(trashed),
+                "error": None,
+            }
+
+        except Exception as e:
+            logger.error(f"get_about_info failed for '{self.remote_name}': {str(e)}")
+            return {
+                "remote": self.remote_name,
+                "total_bytes": 0, "used_bytes": 0, "free_bytes": 0,
+                "total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0,
+                "error": str(e),
+            }
+
+
 
     def _validate_path(self, path: str) -> str:
         """Validate and sanitize file path. TIDAK BERUBAH."""

@@ -10,9 +10,11 @@
 # ==========================================
 fastapi==0.109.2
 uvicorn[standard]==0.27.1
+gunicorn==21.2.0           # Multi-worker production server (Linux/Mac only)
 pydantic==2.6.1
 pydantic-settings==2.1.0
 python-multipart==0.0.9
+
 
 # Database & ORM
 # ==========================================

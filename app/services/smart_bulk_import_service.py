@@ -983,7 +983,7 @@ class SmartBulkImportService:
         Returns:
             Upload result dict (struktur sama dengan versi lama)
         """
-        from app.models.models import Chapter, Page
+        from app.models.models import Chapter, Page, Manga, utcnow as _utcnow
 
         chapter_folder_name = chapter_info["chapter_folder_name"]
         chapter_main = chapter_info["chapter_main"]
@@ -992,8 +992,22 @@ class SmartBulkImportService:
         image_files: List[Path] = chapter_info["files"]
         preview_path: Optional[Path] = chapter_info.get("preview_path")
 
-        # ⚡ Gunakan rclone service dari bulk_service (sudah tervalidasi)
-        rclone = self.bulk_service.rclone
+        # ✅ GROUP-AWARE: Dapatkan remotes sesuai active upload group
+        from app.services.storage_group_service import get_storage_group_service
+        sgs = get_storage_group_service()
+        primary_remote, backup_remotes, path_prefix = sgs.get_all_remotes_for_upload()
+        active_group = sgs.get_upload_group()
+
+        # Dapatkan rclone instance untuk primary remote active group
+        from app.services.rclone_service import RcloneService
+        rclone = RcloneService._instances.get(primary_remote) or self.bulk_service.rclone
+        if rclone.remote_name != primary_remote:
+            # Fallback: gunakan bulk_service.rclone (group 1)
+            rclone = self.bulk_service.rclone
+            logger.warning(
+                f"Primary remote '{primary_remote}' for group {active_group} not initialized, "
+                f"falling back to bulk_service.rclone ({rclone.remote_name})"
+            )
 
         # GDrive destination paths
         manga_folder = f"{base_folder_id}/{manga_slug}"
@@ -1096,10 +1110,9 @@ class SmartBulkImportService:
             # --------------------------------------------------
             # STEP 4: ⚡ Auto-mirror ke backup remotes (paralel)
             #
-            # Pakai rclone copy dari source remote ke backup remote
-            # (server-side copy, tidak perlu download ulang ke lokal)
+            # ✅ GROUP-AWARE: Pakai backup remotes dari active group
+            # (bukan hardcode get_secondary_remotes() = group 1 saja)
             # --------------------------------------------------
-            backup_remotes = settings.get_secondary_remotes()
             if backup_remotes:
                 logger.info(
                     f"🔄 Mirroring to {len(backup_remotes)} backup remote(s): "
@@ -1199,11 +1212,14 @@ class SmartBulkImportService:
 
             # --------------------------------------------------
             # STEP 7: Create page records
+            # ✅ GROUP-AWARE: Simpan path dengan prefix @N/ jika non-group 1
             # --------------------------------------------------
             for page_info in staged_files:
+                # Buat DB path dengan group prefix (@N/ atau kosong untuk group 1)
+                db_page_path = f"{path_prefix}{page_info['gdrive_path']}"
                 page = Page(
                     chapter_id=new_chapter.id,
-                    gdrive_file_id=page_info["gdrive_path"],
+                    gdrive_file_id=db_page_path,
                     page_order=page_info["page_order"],
                     is_anchor=(page_info["page_order"] == 1)
                 )
@@ -1211,20 +1227,29 @@ class SmartBulkImportService:
 
             # --------------------------------------------------
             # STEP 8: ✨ Set anchor_path & preview_url
+            # ✅ GROUP-AWARE: anchor_path disimpan dengan prefix @N/
+            #    Image proxy akan parse prefix dan route ke group yang benar
             # --------------------------------------------------
             if preview_uploaded and preview_gdrive_path:
                 # Use custom preview
-                new_chapter.anchor_path = preview_gdrive_path
-                new_chapter.preview_url = f"/api/v1/image-proxy/image/{preview_gdrive_path}"
+                db_anchor = f"{path_prefix}{preview_gdrive_path}"
+                new_chapter.anchor_path = db_anchor
+                new_chapter.preview_url = f"/api/v1/image-proxy/image/{db_anchor}"
                 preview_type = "custom"
             else:
                 # Fallback to page 1
                 if staged_files:
-                    new_chapter.anchor_path = staged_files[0]["gdrive_path"]
-                    new_chapter.preview_url = f"/api/v1/image-proxy/image/{staged_files[0]['gdrive_path']}"
+                    db_anchor = f"{path_prefix}{staged_files[0]['gdrive_path']}"
+                    new_chapter.anchor_path = db_anchor
+                    new_chapter.preview_url = f"/api/v1/image-proxy/image/{db_anchor}"
                     preview_type = "page_1"
                 else:
                     preview_type = "none"
+
+            # ✅ Update manga.updated_at agar tetap sinkron dengan chapter terbaru
+            manga_record = self.db.query(Manga).filter(Manga.id == manga_id).first()
+            if manga_record:
+                manga_record.updated_at = _utcnow()
 
             self.db.commit()
 
